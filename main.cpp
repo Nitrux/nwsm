@@ -17,6 +17,7 @@
 #include <sys/file.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
+#include <syslog.h>
 #include <sys/socket.h>
 #include <set>
 #include <string>
@@ -138,6 +139,9 @@ void install_signal_handlers()
 
 void log_message(const std::string& message)
 {
+    ::openlog("nwsm", LOG_PID | LOG_NDELAY, LOG_USER);
+    ::syslog(LOG_ERR, "%s", message.c_str());
+    ::closelog();
     std::cerr << "nwsm: " << message << '\n';
 }
 
