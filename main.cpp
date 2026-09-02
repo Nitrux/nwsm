@@ -18,6 +18,7 @@
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <syslog.h>
+#include <system_error>
 #include <sys/socket.h>
 #include <set>
 #include <string>
@@ -1110,11 +1111,13 @@ bool migrate_existing_user()
         return false;
 
     const auto marker_status = fs::symlink_status(marker, error);
-    if (error) {
+    const bool marker_missing = error == std::errc::no_such_file_or_directory;
+    if (error && !marker_missing) {
         log_message("cannot inspect the existing-user migration marker: " + error.message());
         return false;
     }
-    if (marker_status.type() != fs::file_type::not_found) {
+    error.clear();
+    if (!marker_missing && marker_status.type() != fs::file_type::not_found) {
         if (marker_status.type() != fs::file_type::regular) {
             log_message("the existing-user migration marker is not a regular file");
             return false;
