@@ -1099,9 +1099,10 @@ bool migrate_existing_user()
     }
 
     const fs::path rc_directory = *config_home / "rc";
+    const fs::path desktop_runlevel = rc_directory / "runlevels" / "desktop";
     const fs::path marker = rc_directory / ".nwsm-migrated";
     std::error_code error;
-    fs::create_directories(rc_directory, error);
+    fs::create_directories(desktop_runlevel, error);
     if (error) {
         log_message("cannot create the user OpenRC configuration directory: " + error.message());
         return false;
@@ -1117,34 +1118,91 @@ bool migrate_existing_user()
         return false;
     }
     error.clear();
+    bool marker_present = false;
     if (!marker_missing && marker_status.type() != fs::file_type::not_found) {
         if (marker_status.type() != fs::file_type::regular) {
             log_message("the existing-user migration marker is not a regular file");
             return false;
         }
-        return true;
+        marker_present = true;
     }
 
     const auto seeded_services = seed_user_services();
     if (!seeded_services.has_value())
         return false;
 
-    const std::string rc_update = resolve_executable("rc-update");
-    if (rc_update.empty()) {
-        log_message("rc-update was not found; existing-user migration was not completed");
-        return false;
-    }
-
+    constexpr const char* seed_runlevel_path = "/etc/skel/.config/rc/runlevels/desktop";
     bool success = true;
     for (const std::string& service : *seeded_services) {
-        if (run_command({rc_update, "-U", "add", service, "desktop"}, true) != 0) {
-            log_message("could not add user service " + service + " to desktop");
+        const fs::path seed_entry = fs::path(seed_runlevel_path) / service;
+        std::error_code link_error;
+        const fs::path target = fs::read_symlink(seed_entry, link_error);
+        if (link_error) {
+            log_message("cannot read the seeded user service link " + service + ": " + link_error.message());
+            success = false;
+            continue;
+        }
+        if (!target.is_absolute() || target.parent_path() != fs::path("/etc/user/init.d")
+            || target.filename() != service) {
+            log_message("the seeded user service link " + service + " does not point to its full /etc/user/init.d path");
+            success = false;
+            continue;
+        }
+
+        const fs::path destination = desktop_runlevel / service;
+        link_error.clear();
+        const bool destination_is_symlink = fs::is_symlink(destination, link_error);
+        if (link_error) {
+            log_message("cannot inspect the user service link " + service + ": " + link_error.message());
+            success = false;
+            continue;
+        }
+
+        if (destination_is_symlink) {
+            link_error.clear();
+            if (fs::exists(destination, link_error))
+                continue;
+            if (link_error) {
+                log_message("cannot inspect the user service link " + service + ": " + link_error.message());
+                success = false;
+                continue;
+            }
+        } else {
+            link_error.clear();
+            if (fs::exists(destination, link_error)) {
+                if (!fs::remove(destination, link_error)) {
+                    log_message("could not replace the regular user service entry " + service + ": " + link_error.message());
+                    success = false;
+                    continue;
+                }
+            } else if (link_error) {
+                log_message("cannot inspect the user service entry " + service + ": " + link_error.message());
+                success = false;
+                continue;
+            }
+        }
+
+        if (destination_is_symlink) {
+            link_error.clear();
+            if (!fs::remove(destination, link_error)) {
+                log_message("could not replace the dangling user service link " + service + ": " + link_error.message());
+                success = false;
+                continue;
+            }
+        }
+
+        link_error.clear();
+        fs::create_symlink(target, destination, link_error);
+        if (link_error) {
+            log_message("could not create the user service link " + service + ": " + link_error.message());
             success = false;
         }
     }
 
     if (!success)
         return false;
+    if (marker_present)
+        return true;
 
     ScopedFd marker_file(::open(marker.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600));
     if (!marker_file.valid()) {
