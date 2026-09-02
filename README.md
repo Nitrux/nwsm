@@ -1,6 +1,6 @@
 # Nitrux Workspace Session Manager | ![License](https://img.shields.io/badge/License-BSD--3--Clause-blue)
 
-# Introduction.
+# Introduction
 
 `nwsm` is a small Wayland session lifecycle manager for OpenRC user services.
 
