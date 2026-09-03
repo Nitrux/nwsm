@@ -10,11 +10,13 @@ OpenRC remains responsible for supervising long-running user services. `nwsm` bi
 
 ## Features
 
-- Verifies Wayland socket readiness before activating session services.
-- Publishes the compositor environment through `nwsm finalize`.
+- Verifies new Wayland and required compositor IPC sockets before activating session services.
+- Publishes manager-discovered compositor state automatically; `nwsm finalize` optionally adds compositor-provided variables.
 - Activates and shuts down the OpenRC user `desktop` runlevel.
 - Refreshes Wayland, compositor, and D-Bus environment after compositor replacement.
-- Migrates existing users to the seeded OpenRC desktop runlevel without overwriting custom services.
+- Migrates existing users through `rc-update -U` without overwriting custom services or blocking the graphical session.
+- Reconciles stale user services before startup and restores the previous activation environment at shutdown.
+- Provides `check`, `status`, and `stop` lifecycle controls.
 - Stops the OpenRC runlevel and removes stale handoff data on exit.
 
 ## System Requirements
@@ -29,11 +31,14 @@ wayland
 
 ```text
 nwsm finalize
+nwsm check
+nwsm status
+nwsm stop
 nwsm -- <wayland-session-command> [arguments...]
 ```
 
 > [!NOTE]
-> Readiness and finalization timeouts default to 60 and 30 seconds. Set `NWSM_READY_TIMEOUT` or `NWSM_FINALIZE_TIMEOUT` to adjust them.
+> Readiness defaults to 60 seconds. Optional finalization has a one-second grace period and is never required for startup. Set `NWSM_READY_TIMEOUT` or `NWSM_FINALIZE_GRACE` to adjust them. Comma- or space-separate manager-discovered requirements such as `HYPRLAND_INSTANCE_SIGNATURE` in `NWSM_REQUIRED_VARS`.
 
 # Licensing
 

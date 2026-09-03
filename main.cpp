@@ -41,7 +41,7 @@ volatile std::sig_atomic_t session_process_pgid = -1;
 
 constexpr std::chrono::milliseconds poll_interval{100};
 constexpr std::chrono::seconds default_ready_timeout{60};
-constexpr std::chrono::seconds default_finalize_timeout{30};
+constexpr std::chrono::seconds default_finalize_grace{1};
 constexpr const char* finalization_file_name = "nwsm.finalize";
 
 struct SocketIdentity {
@@ -66,6 +66,13 @@ struct ChildState {
     bool reaped{false};
     int status{0};
 };
+
+struct CompositorReadiness {
+    std::pair<std::string, SocketIdentity> wayland;
+    std::optional<std::string> hyprland_signature;
+};
+
+using EnvironmentSnapshot = std::vector<std::pair<std::string, std::string>>;
 
 class ScopedFd {
 public:
@@ -480,6 +487,29 @@ bool read_socket_data(int descriptor, void* data, std::size_t size)
     return true;
 }
 
+bool verify_local_socket(const fs::path& path)
+{
+    const std::string socket_path = path.string();
+    struct sockaddr_un address {};
+    if (socket_path.size() >= sizeof(address.sun_path))
+        return false;
+
+    ScopedFd descriptor(::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0));
+    if (!descriptor.valid())
+        return false;
+    address.sun_family = AF_UNIX;
+    std::memcpy(address.sun_path, socket_path.c_str(), socket_path.size() + 1);
+    if (::connect(descriptor.get(), reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0)
+        return true;
+    if (errno != EINPROGRESS || !wait_for_socket_event(descriptor.get(), POLLOUT))
+        return false;
+
+    int socket_error = 0;
+    socklen_t socket_error_size = sizeof(socket_error);
+    return ::getsockopt(descriptor.get(), SOL_SOCKET, SO_ERROR, &socket_error, &socket_error_size) == 0
+        && socket_error == 0;
+}
+
 bool verify_wayland_socket(const fs::path& path)
 {
     const std::string socket_path = path.string();
@@ -578,6 +608,56 @@ std::set<std::string> snapshot_hyprland_signatures(const fs::path& runtime)
             signatures.insert(signature);
     }
     return signatures;
+}
+
+bool is_safe_component(const std::string& value);
+
+std::optional<std::string> find_new_hyprland_signature(
+    const fs::path& runtime,
+    const std::set<std::string>& known_signatures)
+{
+    std::vector<std::string> candidates;
+    std::error_code error;
+    const fs::path hyprland_root = runtime / "hypr";
+    for (const auto& entry : fs::directory_iterator(hyprland_root, error)) {
+        if (error)
+            break;
+        const std::string signature = entry.path().filename().string();
+        if (!is_safe_component(signature) || known_signatures.contains(signature))
+            continue;
+        const fs::path socket_path = entry.path() / ".socket.sock";
+        if (socket_identity(socket_path).has_value() && verify_local_socket(socket_path))
+            candidates.push_back(signature);
+    }
+
+    std::sort(candidates.begin(), candidates.end());
+    if (candidates.size() == 1)
+        return candidates.front();
+    return std::nullopt;
+}
+
+bool required_environment_name(const std::string& expected)
+{
+    auto configured = environment_value("NWSM_REQUIRED_VARS");
+    if (!configured.has_value())
+        configured = environment_value("NWSM_FINALIZE_REQUIRED_VARS");
+    if (!configured.has_value())
+        return false;
+
+    std::size_t begin = 0;
+    while (begin < configured->size()) {
+        while (begin < configured->size()
+            && ((*configured)[begin] == 32 || (*configured)[begin] == 9 || (*configured)[begin] == 44))
+            ++begin;
+        std::size_t end = begin;
+        while (end < configured->size()
+            && (*configured)[end] != 32 && (*configured)[end] != 9 && (*configured)[end] != 44)
+            ++end;
+        if (configured->substr(begin, end - begin) == expected)
+            return true;
+        begin = end;
+    }
+    return false;
 }
 
 bool is_safe_component(const std::string& value)
@@ -700,7 +780,7 @@ bool finalization_is_valid(
     const RuntimeDirectory& runtime,
     const std::vector<std::pair<std::string, std::string>>& environment,
     const std::string& expected_display,
-    const std::set<std::string>& known_hyprland_signatures)
+    const std::optional<std::string>& expected_signature)
 {
     const std::string* display = finalized_value(environment, "WAYLAND_DISPLAY");
     if (display == nullptr || *display != expected_display)
@@ -708,24 +788,11 @@ bool finalization_is_valid(
 
     if (const std::string* signature = finalized_value(environment, "HYPRLAND_INSTANCE_SIGNATURE");
         signature != nullptr) {
-        if (!is_safe_component(*signature) || known_hyprland_signatures.contains(*signature))
+        if (!is_safe_component(*signature)
+            || (expected_signature.has_value() && *signature != *expected_signature))
             return false;
         if (!socket_identity(runtime.path / "hypr" / *signature / ".socket.sock").has_value())
             return false;
-    }
-
-    if (const auto required = environment_value("NWSM_FINALIZE_REQUIRED_VARS"); required.has_value()) {
-        std::size_t begin = 0;
-        while (begin <= required->size()) {
-            const std::size_t end = required->find(",", begin);
-            const std::string name = required->substr(begin, end == std::string::npos ? end : end - begin);
-            if (!is_finalization_environment_name(name)
-                || finalized_value(environment, name.c_str()) == nullptr)
-                return false;
-            if (end == std::string::npos)
-                break;
-            begin = end + 1;
-        }
     }
 
     return true;
@@ -740,44 +807,36 @@ bool remove_finalization_file(const RuntimeDirectory& runtime)
     return true;
 }
 
-bool apply_finalized_environment(
+bool merge_finalized_environment(
     const std::vector<std::pair<std::string, std::string>>& environment)
 {
-    bool success = true;
-    for (const char* name : finalization_environment_names) {
-        if (::unsetenv(name) != 0) {
-            log_message(std::string("could not clear ") + name + ": " + std::strerror(errno));
-            success = false;
-        }
-    }
-
     for (const auto& [name, value] : environment) {
         if (::setenv(name.c_str(), value.c_str(), 1) != 0) {
             log_message(std::string("could not import ") + name + ": " + std::strerror(errno));
-            success = false;
+            return false;
         }
     }
-    return success;
+    return true;
 }
 
-std::chrono::seconds finalization_timeout()
+std::chrono::seconds finalization_grace()
 {
-    const auto value = environment_value("NWSM_FINALIZE_TIMEOUT");
+    const auto value = environment_value("NWSM_FINALIZE_GRACE");
     if (!value.has_value())
-        return default_finalize_timeout;
+        return default_finalize_grace;
 
     char* end = nullptr;
     errno = 0;
     const long seconds = std::strtol(value->c_str(), &end, 10);
-    if (errno == 0 && end != value->c_str() && *end == 0 && seconds > 0 && seconds <= 600)
+    if (errno == 0 && end != value->c_str() && *end == 0 && seconds >= 0 && seconds <= 30)
         return std::chrono::seconds(seconds);
-    return default_finalize_timeout;
+    return default_finalize_grace;
 }
 
 std::optional<std::vector<std::pair<std::string, std::string>>> wait_for_finalization(
     const RuntimeDirectory& runtime,
     const std::string& expected_display,
-    const std::set<std::string>& known_hyprland_signatures,
+    const std::optional<std::string>& expected_signature,
     ChildState& child,
     std::chrono::seconds timeout)
 {
@@ -788,7 +847,7 @@ std::optional<std::vector<std::pair<std::string, std::string>>> wait_for_finaliz
 
         if (const auto environment = read_finalization_file(runtime);
             environment.has_value()
-            && finalization_is_valid(runtime, *environment, expected_display, known_hyprland_signatures))
+            && finalization_is_valid(runtime, *environment, expected_display, expected_signature))
             return environment;
         std::this_thread::sleep_for(poll_interval);
     }
@@ -878,19 +937,29 @@ std::chrono::seconds readiness_timeout()
     return default_ready_timeout;
 }
 
-std::optional<std::pair<std::string, SocketIdentity>> wait_for_new_wayland_socket(
+std::optional<CompositorReadiness> wait_for_compositor_readiness(
     const fs::path& runtime,
     const std::set<SocketIdentity>& known_sockets,
+    const std::set<std::string>& known_hyprland_signatures,
     ChildState& child,
     std::chrono::seconds timeout)
 {
+    const bool require_hyprland_signature = required_environment_name("HYPRLAND_INSTANCE_SIGNATURE");
     const auto deadline = std::chrono::steady_clock::now() + timeout;
+    std::optional<std::pair<std::string, SocketIdentity>> wayland;
+    std::optional<std::string> hyprland_signature;
+
     while (!stop_requested && std::chrono::steady_clock::now() < deadline) {
         if (!poll_session_process(child))
             return std::nullopt;
 
-        if (const auto socket = find_new_wayland_socket(runtime, known_sockets); socket.has_value())
-            return socket;
+        if (!wayland.has_value())
+            wayland = find_new_wayland_socket(runtime, known_sockets);
+        if (!hyprland_signature.has_value())
+            hyprland_signature = find_new_hyprland_signature(runtime, known_hyprland_signatures);
+        if (wayland.has_value() && (!require_hyprland_signature || hyprland_signature.has_value()))
+            return CompositorReadiness{*wayland, hyprland_signature};
+
         std::this_thread::sleep_for(poll_interval);
     }
     return std::nullopt;
@@ -923,7 +992,26 @@ constexpr const char* activation_environment_names[] = {
     "HYPRCURSOR_THEME",
 };
 
-bool update_dbus_environment()
+EnvironmentSnapshot snapshot_activation_environment()
+{
+    EnvironmentSnapshot snapshot;
+    for (const char* name : activation_environment_names) {
+        if (const char* value = std::getenv(name); value != nullptr)
+            snapshot.emplace_back(name, value);
+    }
+    return snapshot;
+}
+
+const std::string* snapshot_value(const EnvironmentSnapshot& snapshot, const char* name)
+{
+    for (const auto& [key, value] : snapshot) {
+        if (key == name)
+            return &value;
+    }
+    return nullptr;
+}
+
+bool update_activation_environment()
 {
     const std::string updater = resolve_executable("dbus-update-activation-environment");
     if (updater.empty()) {
@@ -933,8 +1021,8 @@ bool update_dbus_environment()
 
     std::vector<std::string> arguments{updater};
     for (const char* name : activation_environment_names) {
-        if (const char* value = std::getenv(name); value != nullptr)
-            arguments.emplace_back(std::string(name) + "=" + value);
+        const char* value = std::getenv(name);
+        arguments.emplace_back(std::string(name) + "=" + (value == nullptr ? "" : value));
     }
     if (run_command(arguments) != 0) {
         log_message("could not update the session D-Bus activation environment");
@@ -943,7 +1031,7 @@ bool update_dbus_environment()
     return true;
 }
 
-void clear_dbus_environment()
+void restore_activation_environment(const EnvironmentSnapshot& snapshot)
 {
     const std::string updater = resolve_executable("dbus-update-activation-environment");
     if (updater.empty())
@@ -951,20 +1039,22 @@ void clear_dbus_environment()
 
     std::vector<std::string> arguments{updater};
     for (const char* name : activation_environment_names) {
-        arguments.emplace_back("--unset");
-        arguments.emplace_back(name);
+        const std::string* value = snapshot_value(snapshot, name);
+        arguments.emplace_back(std::string(name) + "=" + (value == nullptr ? "" : *value));
     }
     run_command(arguments, true);
 }
 
-bool activate_desktop_runlevel()
+bool activate_desktop_runlevel(bool& attempted)
 {
+    attempted = false;
     const std::string openrc = resolve_executable("openrc");
     if (openrc.empty()) {
         log_message("openrc was not found");
         return false;
     }
 
+    attempted = true;
     if (run_command({openrc, "-U", "desktop"}) != 0) {
         log_message("could not activate the desktop user runlevel");
         return false;
@@ -982,59 +1072,6 @@ bool stop_desktop_runlevel()
 
     if (run_command({openrc, "-U", "shutdown"}) != 0) {
         log_message("could not stop the desktop user runlevel");
-        return false;
-    }
-    return true;
-}
-
-bool remove_broken_user_service_links(const fs::path& config_home)
-{
-    const fs::path desktop_runlevel = config_home / "rc" / "runlevels" / "desktop";
-    std::error_code error;
-    if (!fs::exists(desktop_runlevel, error)) {
-        if (error)
-            log_message("cannot inspect the user desktop runlevel: " + error.message());
-        return !error;
-    }
-    if (!fs::is_directory(desktop_runlevel, error)) {
-        log_message("the user desktop runlevel is not a directory");
-        return false;
-    }
-
-    for (const auto& entry : fs::directory_iterator(desktop_runlevel, error)) {
-        if (error)
-            break;
-        error.clear();
-        if (!fs::is_symlink(entry.path(), error)) {
-            if (error) {
-                log_message("cannot inspect the user desktop runlevel: " + error.message());
-                return false;
-            }
-            continue;
-        }
-
-        const fs::path target = fs::read_symlink(entry.path(), error);
-        if (error) {
-            log_message("cannot read the user service link " + entry.path().filename().string() + ": " + error.message());
-            return false;
-        }
-        if (!target.is_absolute() || target.parent_path() != fs::path("/etc/user/init.d"))
-            continue;
-
-        error.clear();
-        if (fs::exists(target, error))
-            continue;
-        if (error) {
-            log_message("cannot inspect user service target " + target.string() + ": " + error.message());
-            return false;
-        }
-        if (!fs::remove(entry.path(), error)) {
-            log_message("could not remove the broken user service link " + entry.path().filename().string() + ": " + error.message());
-            return false;
-        }
-    }
-    if (error) {
-        log_message("cannot inspect the user desktop runlevel: " + error.message());
         return false;
     }
     return true;
@@ -1108,101 +1145,78 @@ bool migrate_existing_user()
         return false;
     }
 
-    if (!remove_broken_user_service_links(*config_home))
-        return false;
-
-    const auto marker_status = fs::symlink_status(marker, error);
-    const bool marker_missing = error == std::errc::no_such_file_or_directory;
-    if (error && !marker_missing) {
-        log_message("cannot inspect the existing-user migration marker: " + error.message());
-        return false;
-    }
-    error.clear();
-    bool marker_present = false;
-    if (!marker_missing && marker_status.type() != fs::file_type::not_found) {
-        if (marker_status.type() != fs::file_type::regular) {
-            log_message("the existing-user migration marker is not a regular file");
-            return false;
-        }
-        marker_present = true;
-    }
-
     const auto seeded_services = seed_user_services();
     if (!seeded_services.has_value())
         return false;
+
+    const std::string rc_update = resolve_executable("rc-update");
+    if (rc_update.empty()) {
+        log_message("rc-update was not found for existing-user migration");
+        return false;
+    }
 
     constexpr const char* seed_runlevel_path = "/etc/skel/.config/rc/runlevels/desktop";
     bool success = true;
     for (const std::string& service : *seeded_services) {
         const fs::path seed_entry = fs::path(seed_runlevel_path) / service;
+        const fs::path expected_target = fs::path("/etc/user/init.d") / service;
         std::error_code link_error;
-        const fs::path target = fs::read_symlink(seed_entry, link_error);
-        if (link_error) {
-            log_message("cannot read the seeded user service link " + service + ": " + link_error.message());
+        const fs::file_status seed_status = fs::symlink_status(seed_entry, link_error);
+        if (link_error || !fs::is_symlink(seed_status)) {
+            log_message("cannot validate the seeded user service entry " + service);
             success = false;
             continue;
         }
-        if (!target.is_absolute() || target.parent_path() != fs::path("/etc/user/init.d")
-            || target.filename() != service) {
-            log_message("the seeded user service link " + service + " does not point to its full /etc/user/init.d path");
+
+        link_error.clear();
+        if (!fs::equivalent(seed_entry, expected_target, link_error) || link_error) {
+            log_message("the seeded user service link " + service + " does not resolve to " + expected_target.string());
             success = false;
             continue;
         }
 
         const fs::path destination = desktop_runlevel / service;
         link_error.clear();
-        const bool destination_is_symlink = fs::is_symlink(destination, link_error);
-        if (link_error) {
-            log_message("cannot inspect the user service link " + service + ": " + link_error.message());
+        const fs::file_status destination_status = fs::symlink_status(destination, link_error);
+        const bool destination_missing = link_error == std::errc::no_such_file_or_directory
+            || destination_status.type() == fs::file_type::not_found;
+        if (link_error && !destination_missing) {
+            log_message("cannot inspect the user service entry " + service + ": " + link_error.message());
             success = false;
             continue;
         }
 
-        if (destination_is_symlink) {
+        if (!destination_missing) {
             link_error.clear();
-            if (fs::exists(destination, link_error))
+            const bool destination_matches = fs::is_symlink(destination_status)
+                && fs::equivalent(destination, expected_target, link_error);
+            if (destination_matches && !link_error)
                 continue;
-            if (link_error) {
-                log_message("cannot inspect the user service link " + service + ": " + link_error.message());
-                success = false;
-                continue;
-            }
-        } else {
-            link_error.clear();
-            if (fs::exists(destination, link_error)) {
-                if (!fs::remove(destination, link_error)) {
-                    log_message("could not replace the regular user service entry " + service + ": " + link_error.message());
-                    success = false;
-                    continue;
-                }
-            } else if (link_error) {
-                log_message("cannot inspect the user service entry " + service + ": " + link_error.message());
-                success = false;
-                continue;
-            }
+            log_message("preserving the customized user service entry " + service);
+            continue;
         }
 
-        if (destination_is_symlink) {
-            link_error.clear();
-            if (!fs::remove(destination, link_error)) {
-                log_message("could not replace the dangling user service link " + service + ": " + link_error.message());
-                success = false;
-                continue;
-            }
-        }
-
-        link_error.clear();
-        fs::create_symlink(target, destination, link_error);
-        if (link_error) {
-            log_message("could not create the user service link " + service + ": " + link_error.message());
+        if (run_command({rc_update, "-U", "add", service, "desktop"}) != 0) {
+            log_message("could not add the user service " + service + " to the desktop runlevel");
             success = false;
         }
     }
 
     if (!success)
         return false;
-    if (marker_present)
+
+    error.clear();
+    const fs::file_status marker_status = fs::symlink_status(marker, error);
+    if (!error && marker_status.type() == fs::file_type::regular)
         return true;
+    if (error && error != std::errc::no_such_file_or_directory) {
+        log_message("cannot inspect the existing-user migration marker: " + error.message());
+        return false;
+    }
+    if (!error && marker_status.type() != fs::file_type::not_found) {
+        log_message("the existing-user migration marker is not a regular file");
+        return false;
+    }
 
     ScopedFd marker_file(::open(marker.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600));
     if (!marker_file.valid()) {
@@ -1210,19 +1224,7 @@ bool migrate_existing_user()
         return false;
     }
     constexpr char marker_text[] = "Migrated by nwsm.\n";
-    std::size_t written = 0;
-    while (written < sizeof(marker_text) - 1) {
-        const ssize_t result = ::write(marker_file.get(), marker_text + written, sizeof(marker_text) - 1 - written);
-        if (result > 0) {
-            written += static_cast<std::size_t>(result);
-            continue;
-        }
-        if (result < 0 && errno == EINTR)
-            continue;
-        log_message("could not write the existing-user migration marker: " + std::string(std::strerror(errno)));
-        return false;
-    }
-    return true;
+    return write_all(marker_file.get(), marker_text, sizeof(marker_text) - 1);
 }
 
 bool set_session_environment()
@@ -1231,12 +1233,16 @@ bool set_session_environment()
         {"ELECTRON_OZONE_PLATFORM_HINT", "auto"},
         {"GDK_BACKEND", "wayland,x11,*"},
         {"GTK_USE_PORTAL", "1"},
-                        {"QT_AUTO_SCREEN_SCALE_FACTOR", "1"},
+        {"QT_AUTO_SCREEN_SCALE_FACTOR", "1"},
         {"QT_QPA_PLATFORM", "wayland;xcb"},
         {"QT_QPA_PLATFORMTHEME", "kde"},
         {"SDL_VIDEODRIVER", "wayland"},
+        {"HYPRCURSOR_SIZE", "24"},
+        {"HYPRCURSOR_THEME", "nitrux_snow_cursors"},
         {"XCURSOR_SIZE", "24"},
         {"XCURSOR_THEME", "nitrux_snow_cursors"},
+        {"XDG_CURRENT_DESKTOP", "Hyprland"},
+        {"XDG_SESSION_DESKTOP", "Hyprland"},
         {"XDG_SESSION_TYPE", "wayland"},
     };
 
@@ -1248,21 +1254,117 @@ bool set_session_environment()
         }
     }
 
-    if (::unsetenv("WAYLAND_DISPLAY") != 0) {
-        log_message("could not clear WAYLAND_DISPLAY: " + std::string(std::strerror(errno)));
-        success = false;
+    constexpr const char* compositor_variables[] = {
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "HYPRLAND_INSTANCE_SIGNATURE",
+        "HYPRLAND_CMD",
+    };
+    for (const char* name : compositor_variables) {
+        if (::unsetenv(name) != 0) {
+            log_message(std::string("could not clear ") + name + ": " + std::strerror(errno));
+            success = false;
+        }
     }
 
     return success;
 }
 
-bool set_wayland_environment(const std::string& display)
+bool apply_readiness_environment(const CompositorReadiness& readiness)
 {
-    if (::setenv("WAYLAND_DISPLAY", display.c_str(), 1) != 0) {
+    if (!set_session_environment())
+        return false;
+    if (::setenv("WAYLAND_DISPLAY", readiness.wayland.first.c_str(), 1) != 0) {
         log_message("could not set WAYLAND_DISPLAY: " + std::string(std::strerror(errno)));
         return false;
     }
+    if (readiness.hyprland_signature.has_value()
+        && ::setenv("HYPRLAND_INSTANCE_SIGNATURE", readiness.hyprland_signature->c_str(), 1) != 0) {
+        log_message("could not set HYPRLAND_INSTANCE_SIGNATURE: " + std::string(std::strerror(errno)));
+        return false;
+    }
     return true;
+}
+
+bool write_instance_pid(const ScopedFd& lock)
+{
+    const std::string text = std::to_string(::getpid()) + "\n";
+    return ::ftruncate(lock.get(), 0) == 0
+        && ::lseek(lock.get(), 0, SEEK_SET) == 0
+        && write_all(lock.get(), text.data(), text.size())
+        && ::fsync(lock.get()) == 0;
+}
+
+std::optional<pid_t> active_instance_pid(const RuntimeDirectory& runtime)
+{
+    ScopedFd lock(::openat(runtime.descriptor.get(), "nwsm.lock", O_RDWR | O_CLOEXEC | O_NOFOLLOW));
+    if (!lock.valid()) {
+        if (errno == ENOENT)
+            return pid_t{0};
+        log_message("could not inspect the nwsm instance lock: " + std::string(std::strerror(errno)));
+        return std::nullopt;
+    }
+
+    struct stat status {};
+    if (::fstat(lock.get(), &status) != 0 || !S_ISREG(status.st_mode) || status.st_uid != ::geteuid()) {
+        log_message("the nwsm instance lock is not a regular file owned by the current user");
+        return std::nullopt;
+    }
+    if (::flock(lock.get(), LOCK_EX | LOCK_NB) == 0) {
+        ::flock(lock.get(), LOCK_UN);
+        return pid_t{0};
+    }
+    if (errno != EWOULDBLOCK && errno != EAGAIN) {
+        log_message("could not inspect the nwsm instance lock: " + std::string(std::strerror(errno)));
+        return std::nullopt;
+    }
+
+    char buffer[32] {};
+    const ssize_t size = ::pread(lock.get(), buffer, sizeof(buffer) - 1, 0);
+    if (size <= 0) {
+        log_message("the active nwsm instance lock does not contain a PID");
+        return std::nullopt;
+    }
+    char* end = nullptr;
+    errno = 0;
+    const long value = std::strtol(buffer, &end, 10);
+    if (errno != 0 || end == buffer || value <= 1) {
+        log_message("the active nwsm instance lock contains an invalid PID");
+        return std::nullopt;
+    }
+    return static_cast<pid_t>(value);
+}
+
+int control_instance(const RuntimeDirectory& runtime, const std::string& action)
+{
+    const auto pid = active_instance_pid(runtime);
+    if (!pid.has_value())
+        return 1;
+
+    const bool active = *pid > 0;
+    if (action == "check")
+        return active ? 0 : 1;
+    if (action == "status") {
+        std::cout << (active ? "active" : "inactive") << "\n";
+        return active ? 0 : 1;
+    }
+    if (!active)
+        return 0;
+
+    if (::kill(*pid, SIGTERM) != 0 && errno != ESRCH) {
+        log_message("could not stop the active nwsm instance: " + std::string(std::strerror(errno)));
+        return 1;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto current = active_instance_pid(runtime);
+        if (current.has_value() && *current == 0)
+            return 0;
+        std::this_thread::sleep_for(poll_interval);
+    }
+    log_message("timed out while stopping the active nwsm instance");
+    return 1;
 }
 
 int session_process_exit_code(const ChildState& child)
@@ -1277,6 +1379,7 @@ int session_process_exit_code(const ChildState& child)
 int usage(const char* program)
 {
     std::cerr << "Usage: " << program << " finalize\n"
+              << "       " << program << " check|status|stop\n"
               << "       " << program << " -- <wayland-session-command> [arguments...]\n";
     return 2;
 }
@@ -1288,20 +1391,25 @@ int main(int argc, char** argv)
     if (argc == 2 && std::string(argv[1]) == "finalize")
         return finalize_session();
 
+    const bool control_action = argc == 2
+        && (std::string(argv[1]) == "check" || std::string(argv[1]) == "status" || std::string(argv[1]) == "stop");
     const bool dbus_child = argc >= 4 && std::string(argv[1]) == "--nwsm-dbus-child" && std::string(argv[2]) == "--";
     const int session_argument_start = dbus_child ? 3 : 2;
-    if ((!dbus_child && (argc < 3 || std::string(argv[1]) != "--")) || (dbus_child && argc < 4))
+    if (!control_action
+        && ((!dbus_child && (argc < 3 || std::string(argv[1]) != "--")) || (dbus_child && argc < 4)))
         return usage(argv[0]);
 
     const auto runtime_value = environment_value("XDG_RUNTIME_DIR");
-    if (!runtime_value.has_value())
+    if (!runtime_value.has_value()) {
+        log_message("XDG_RUNTIME_DIR is not available for the authenticated user");
         return 1;
+    }
     const auto runtime_directory = open_runtime_directory(*runtime_value);
     if (!runtime_directory.has_value())
         return 1;
 
-    if (!set_session_environment())
-        return 1;
+    if (control_action)
+        return control_instance(*runtime_directory, argv[1]);
 
     if (!dbus_child) {
         const std::string dbus_run_session = resolve_executable("dbus-run-session");
@@ -1328,18 +1436,28 @@ int main(int argc, char** argv)
         execute(reexec);
     }
 
+    const EnvironmentSnapshot activation_environment = snapshot_activation_environment();
+    if (!set_session_environment())
+        return 1;
+
     const auto instance_lock = acquire_instance_lock(*runtime_directory);
     if (!instance_lock.has_value())
         return 1;
+    if (!write_instance_pid(*instance_lock)) {
+        log_message("could not record the active nwsm instance PID");
+        return 1;
+    }
 
     install_signal_handlers();
+
+    if (!stop_desktop_runlevel())
+        log_message("stale user services could not be fully reconciled; continuing session startup");
     if (!migrate_existing_user())
-        return 1;
+        log_message("existing-user service migration was incomplete; continuing session startup");
+    if (!remove_finalization_file(*runtime_directory))
+        log_message("could not remove a stale compositor environment handoff; continuing session startup");
 
     const fs::path runtime = runtime_directory->path;
-    if (!remove_finalization_file(*runtime_directory))
-        return 1;
-
     const std::set<SocketIdentity> known_wayland_sockets = snapshot_wayland_sockets(runtime);
     std::set<SocketIdentity> all_wayland_sockets = known_wayland_sockets;
     const std::set<std::string> known_hyprland_signatures = snapshot_hyprland_signatures(runtime);
@@ -1350,103 +1468,113 @@ int main(int argc, char** argv)
         session_arguments.emplace_back(argv[index]);
 
     const auto session_process = spawn(session_arguments, false, true);
-    if (!session_process.has_value())
+    if (!session_process.has_value()) {
+        restore_activation_environment(activation_environment);
         return 1;
+    }
 
     ChildState child{*session_process};
     session_process_pid = child.pid;
     session_process_pgid = child.pid;
 
     const auto timeout = readiness_timeout();
-    const auto finalize_wait = finalization_timeout();
-    const auto initial_wayland = wait_for_new_wayland_socket(runtime, all_wayland_sockets, child, timeout);
-    if (!initial_wayland.has_value()) {
-        terminate_session_process(child);
+    const auto finalize_grace = finalization_grace();
+    bool activation_environment_changed = false;
+
+    const auto publish_readiness = [&](const CompositorReadiness& readiness) {
+        if (!apply_readiness_environment(readiness))
+            return false;
+
+        if (finalize_grace.count() > 0) {
+            const auto finalized = wait_for_finalization(
+                *runtime_directory, readiness.wayland.first, readiness.hyprland_signature, child, finalize_grace);
+            if (finalized.has_value()) {
+                if (!merge_finalized_environment(*finalized))
+                    return false;
+                if (!remove_finalization_file(*runtime_directory))
+                    log_message("could not consume the compositor environment handoff");
+            }
+            if (child.reaped || stop_requested)
+                return false;
+        }
+
+        if (!update_activation_environment())
+            log_message("activation environment publication was incomplete; continuing the graphical session");
+        else
+            activation_environment_changed = true;
+        return true;
+    };
+
+    const auto initial_readiness = wait_for_compositor_readiness(
+        runtime, all_wayland_sockets, all_hyprland_signatures, child, timeout);
+    if (!initial_readiness.has_value() || !publish_readiness(*initial_readiness)) {
+        if (!child.reaped)
+            terminate_session_process(child);
+        if (activation_environment_changed)
+            restore_activation_environment(activation_environment);
+        remove_finalization_file(*runtime_directory);
         return child.reaped ? session_process_exit_code(child) : 1;
     }
-    all_wayland_sockets.insert(initial_wayland->second);
+    all_wayland_sockets.insert(initial_readiness->wayland.second);
+    if (initial_readiness->hyprland_signature.has_value())
+        all_hyprland_signatures.insert(*initial_readiness->hyprland_signature);
 
-    if (!set_wayland_environment(initial_wayland->first)) {
-        terminate_session_process(child);
-        return 1;
-    }
-    const auto initial_environment = wait_for_finalization(
-        *runtime_directory, initial_wayland->first, all_hyprland_signatures, child, finalize_wait);
-    if (!initial_environment.has_value()) {
-        log_message("compositor finalization was not received");
-        terminate_session_process(child);
-        clear_dbus_environment();
-        return child.reaped ? session_process_exit_code(child) : 1;
-    }
-    if (!apply_finalized_environment(*initial_environment) || !update_dbus_environment()) {
-        terminate_session_process(child);
-        clear_dbus_environment();
-        return 1;
-    }
-    if (const std::string* signature = finalized_value(*initial_environment, "HYPRLAND_INSTANCE_SIGNATURE");
-        signature != nullptr)
-        all_hyprland_signatures.insert(*signature);
+    bool desktop_runlevel_active = false;
+    if (!activate_desktop_runlevel(desktop_runlevel_active))
+        log_message("desktop user services could not be fully activated; continuing the graphical session");
 
-    if (!activate_desktop_runlevel()) {
-        stop_desktop_runlevel();
-        terminate_session_process(child);
-        clear_dbus_environment();
-        return 1;
-    }
-    bool desktop_runlevel_active = true;
-
-    std::pair<std::string, SocketIdentity> active_wayland = *initial_wayland;
+    CompositorReadiness active_readiness = *initial_readiness;
     while (!stop_requested && !child.reaped) {
         std::this_thread::sleep_for(poll_interval);
         if (!poll_session_process(child))
             break;
 
-        if (wayland_socket_is_active(runtime, active_wayland.first, active_wayland.second))
+        const auto late_finalization = read_finalization_file(*runtime_directory);
+        if (late_finalization.has_value()
+            && finalization_is_valid(
+                *runtime_directory, *late_finalization, active_readiness.wayland.first, active_readiness.hyprland_signature)) {
+            if (merge_finalized_environment(*late_finalization)) {
+                if (!update_activation_environment())
+                    log_message("late compositor environment publication was incomplete");
+                else
+                    activation_environment_changed = true;
+            }
+            if (!remove_finalization_file(*runtime_directory))
+                log_message("could not consume the late compositor environment handoff");
+        }
+
+        if (wayland_socket_is_active(
+                runtime, active_readiness.wayland.first, active_readiness.wayland.second))
             continue;
 
         if (desktop_runlevel_active) {
-            if (!stop_desktop_runlevel()) {
-                terminate_session_process(child);
-                break;
-            }
+            if (!stop_desktop_runlevel())
+                log_message("desktop user services did not stop cleanly before compositor replacement; continuing recovery");
             desktop_runlevel_active = false;
         }
-        if (!remove_finalization_file(*runtime_directory)) {
+        if (!remove_finalization_file(*runtime_directory))
+            log_message("could not remove the previous compositor environment handoff");
+
+        const auto replacement_readiness = wait_for_compositor_readiness(
+            runtime, all_wayland_sockets, all_hyprland_signatures, child, timeout);
+        if (!replacement_readiness.has_value()) {
+            log_message("replacement compositor did not become ready");
             terminate_session_process(child);
             break;
         }
 
-        const auto replacement_wayland = wait_for_new_wayland_socket(runtime, all_wayland_sockets, child, timeout);
-        if (!replacement_wayland.has_value()) {
-            log_message("replacement compositor did not create a new Wayland socket");
+        if (!publish_readiness(*replacement_readiness)) {
             terminate_session_process(child);
             break;
         }
-        all_wayland_sockets.insert(replacement_wayland->second);
+        desktop_runlevel_active = false;
+        if (!activate_desktop_runlevel(desktop_runlevel_active))
+            log_message("desktop user services could not be reactivated; continuing the graphical session");
 
-        if (!set_wayland_environment(replacement_wayland->first)) {
-            terminate_session_process(child);
-            break;
-        }
-
-        const auto replacement_environment = wait_for_finalization(
-            *runtime_directory, replacement_wayland->first, all_hyprland_signatures, child, finalize_wait);
-        if (!replacement_environment.has_value()) {
-            log_message("replacement compositor finalization was not received");
-            terminate_session_process(child);
-            break;
-        }
-        if (!apply_finalized_environment(*replacement_environment) || !update_dbus_environment()
-            || !activate_desktop_runlevel()) {
-            terminate_session_process(child);
-            break;
-        }
-        if (const std::string* signature = finalized_value(*replacement_environment, "HYPRLAND_INSTANCE_SIGNATURE");
-            signature != nullptr)
-            all_hyprland_signatures.insert(*signature);
-
-        desktop_runlevel_active = true;
-        active_wayland = *replacement_wayland;
+        all_wayland_sockets.insert(replacement_readiness->wayland.second);
+        if (replacement_readiness->hyprland_signature.has_value())
+            all_hyprland_signatures.insert(*replacement_readiness->hyprland_signature);
+        active_readiness = *replacement_readiness;
     }
 
     if (session_process_pgid > 0 || !child.reaped)
@@ -1454,7 +1582,8 @@ int main(int argc, char** argv)
     bool shutdown_failed = false;
     if (desktop_runlevel_active)
         shutdown_failed = !stop_desktop_runlevel();
-    clear_dbus_environment();
+    if (activation_environment_changed)
+        restore_activation_environment(activation_environment);
     remove_finalization_file(*runtime_directory);
 
     if (stop_requested)
