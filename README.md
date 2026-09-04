@@ -14,7 +14,7 @@ OpenRC remains responsible for supervising long-running user services. `nwsm` bi
 - Publishes manager-discovered compositor state automatically; `nwsm finalize` optionally adds compositor-provided variables.
 - Activates and shuts down the OpenRC user `desktop` runlevel.
 - Refreshes Wayland, compositor, and D-Bus environment after compositor replacement.
-- Migrates existing users through `rc-update -U` without overwriting custom services or blocking the graphical session.
+- Registers the managed desktop services through `rc-update -U` without overwriting custom services or blocking the graphical session.
 - Reconciles stale user services before startup and restores the previous activation environment at shutdown.
 - Provides `check`, `status`, and `stop` lifecycle controls.
 - Stops the OpenRC runlevel and removes stale handoff data on exit.

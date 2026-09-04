@@ -1077,41 +1077,26 @@ bool stop_desktop_runlevel()
     return true;
 }
 
-std::optional<std::vector<std::string>> seed_user_services()
+const std::vector<std::string>& managed_user_services()
 {
-    const fs::path seed_runlevel = "/etc/skel/.config/rc/runlevels/desktop";
-    std::error_code error;
-    if (!fs::exists(seed_runlevel, error)) {
-        if (error)
-            log_message("cannot inspect the system desktop runlevel seed: " + error.message());
-        return error ? std::nullopt : std::optional<std::vector<std::string>>{std::vector<std::string>{}};
-    }
-    if (!fs::is_directory(seed_runlevel, error)) {
-        log_message("the system desktop runlevel seed is not a directory");
-        return std::nullopt;
-    }
-
-    std::vector<std::string> services;
-    for (const auto& entry : fs::directory_iterator(seed_runlevel, error)) {
-        if (error)
-            break;
-        const std::string name = entry.path().filename().string();
-        if (name.empty() || name.front() == 46)
-            continue;
-        error.clear();
-        if (fs::is_symlink(entry.path(), error))
-            services.push_back(name);
-        else if (error) {
-            log_message("cannot inspect the system desktop runlevel seed: " + error.message());
-            return std::nullopt;
-        }
-    }
-    if (error) {
-        log_message("cannot inspect the system desktop runlevel seed: " + error.message());
-        return std::nullopt;
-    }
-
-    std::sort(services.begin(), services.end());
+    static const std::vector<std::string> services{
+        "dmemcg-booster",
+        "gamemoded",
+        "hyprscreend",
+        "marina",
+        "maui-bluetooth-obex-agent",
+        "nudge-osd",
+        "nx-apphubd",
+        "nx-powerd",
+        "openrazer-daemon",
+        "pipewire",
+        "pipewire-pulse",
+        "polkit-nx-agent",
+        "valenz",
+        "vicinae",
+        "wireplumber",
+        "xdg-desktop-portal",
+    };
     return services;
 }
 
@@ -1145,55 +1130,64 @@ bool migrate_existing_user()
         return false;
     }
 
-    const auto seeded_services = seed_user_services();
-    if (!seeded_services.has_value())
-        return false;
-
     const std::string rc_update = resolve_executable("rc-update");
     if (rc_update.empty()) {
-        log_message("rc-update was not found for existing-user migration");
+        log_message("rc-update was not found for user service registration");
         return false;
     }
 
-    constexpr const char* seed_runlevel_path = "/etc/skel/.config/rc/runlevels/desktop";
     bool success = true;
-    for (const std::string& service : *seeded_services) {
-        const fs::path seed_entry = fs::path(seed_runlevel_path) / service;
+    for (const std::string& service : managed_user_services()) {
         const fs::path expected_target = fs::path("/etc/user/init.d") / service;
-        std::error_code link_error;
-        const fs::file_status seed_status = fs::symlink_status(seed_entry, link_error);
-        if (link_error || !fs::is_symlink(seed_status)) {
-            log_message("cannot validate the seeded user service entry " + service);
-            success = false;
-            continue;
-        }
-
-        link_error.clear();
-        if (!fs::equivalent(seed_entry, expected_target, link_error) || link_error) {
-            log_message("the seeded user service link " + service + " does not resolve to " + expected_target.string());
+        std::error_code entry_error;
+        if (!fs::is_regular_file(expected_target, entry_error) || entry_error) {
+            log_message("the user service definition " + expected_target.string() + " is unavailable");
             success = false;
             continue;
         }
 
         const fs::path destination = desktop_runlevel / service;
-        link_error.clear();
-        const fs::file_status destination_status = fs::symlink_status(destination, link_error);
-        const bool destination_missing = link_error == std::errc::no_such_file_or_directory
+        entry_error.clear();
+        const fs::file_status destination_status = fs::symlink_status(destination, entry_error);
+        const bool destination_missing = entry_error == std::errc::no_such_file_or_directory
             || destination_status.type() == fs::file_type::not_found;
-        if (link_error && !destination_missing) {
-            log_message("cannot inspect the user service entry " + service + ": " + link_error.message());
+        if (entry_error && !destination_missing) {
+            log_message("cannot inspect the user service entry " + service + ": " + entry_error.message());
             success = false;
             continue;
         }
 
         if (!destination_missing) {
-            link_error.clear();
-            const bool destination_matches = fs::is_symlink(destination_status)
-                && fs::equivalent(destination, expected_target, link_error);
-            if (destination_matches && !link_error)
+            bool destination_matches = false;
+            bool replace_managed_link = false;
+            if (fs::is_symlink(destination_status)) {
+                entry_error.clear();
+                destination_matches = fs::equivalent(destination, expected_target, entry_error);
+                entry_error.clear();
+                const fs::path target = fs::read_symlink(destination, entry_error);
+                if (!entry_error) {
+                    const fs::path target_parent = target.parent_path();
+                    replace_managed_link = target == expected_target
+                        || (target.filename() == service
+                            && target_parent.filename() == "init.d"
+                            && target_parent.parent_path().filename() == "user");
+                }
+            }
+
+            if (destination_matches)
                 continue;
-            log_message("preserving the customized user service entry " + service);
-            continue;
+            if (!replace_managed_link) {
+                log_message("preserving the customized user service entry " + service);
+                continue;
+            }
+
+            entry_error.clear();
+            if (!fs::remove(destination, entry_error) || entry_error) {
+                log_message("could not replace the legacy user service link " + service
+                    + (entry_error ? ": " + entry_error.message() : ""));
+                success = false;
+                continue;
+            }
         }
 
         if (run_command({rc_update, "-U", "add", service, "desktop"}) != 0) {
