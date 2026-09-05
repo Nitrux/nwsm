@@ -1077,30 +1077,43 @@ bool stop_desktop_runlevel()
     return true;
 }
 
-const std::vector<std::string>& managed_user_services()
+std::optional<std::vector<std::string>> installed_user_services()
 {
-    static const std::vector<std::string> services{
-        "dmemcg-booster",
-        "gamemoded",
-        "hyprscreend",
-        "marina",
-        "maui-bluetooth-obex-agent",
-        "nudge-osd",
-        "nx-apphubd",
-        "nx-powerd",
-        "openrazer-daemon",
-        "pipewire",
-        "pipewire-pulse",
-        "polkit-nx-agent",
-        "valenz",
-        "vicinae",
-        "wireplumber",
-        "xdg-desktop-portal",
-    };
+    const fs::path init_directory = "/etc/user/init.d";
+    std::error_code error;
+    if (!fs::is_directory(init_directory, error)) {
+        log_message("the OpenRC user service directory is unavailable"
+            + (error ? ": " + error.message() : ""));
+        return std::nullopt;
+    }
+
+    std::vector<std::string> services;
+    for (const auto& entry : fs::directory_iterator(init_directory, error)) {
+        if (error)
+            break;
+        const std::string name = entry.path().filename().string();
+        if (name.empty() || name.front() == 46)
+            continue;
+
+        error.clear();
+        const fs::file_status status = entry.symlink_status(error);
+        if (!error && fs::is_regular_file(status))
+            services.push_back(name);
+        else if (error) {
+            log_message("cannot inspect the OpenRC user service directory: " + error.message());
+            return std::nullopt;
+        }
+    }
+    if (error) {
+        log_message("cannot inspect the OpenRC user service directory: " + error.message());
+        return std::nullopt;
+    }
+
+    std::sort(services.begin(), services.end());
     return services;
 }
 
-bool migrate_existing_user()
+bool register_user_services()
 {
     const auto config_home = [&]() -> std::optional<fs::path> {
         if (const auto configured = environment_value("XDG_CONFIG_HOME"); configured.has_value()) {
@@ -1116,19 +1129,21 @@ bool migrate_existing_user()
     }();
 
     if (!config_home.has_value()) {
-        log_message("cannot determine an absolute XDG_CONFIG_HOME for user migration");
+        log_message("cannot determine an absolute XDG_CONFIG_HOME for user service registration");
         return false;
     }
 
-    const fs::path rc_directory = *config_home / "rc";
-    const fs::path desktop_runlevel = rc_directory / "runlevels" / "desktop";
-    const fs::path marker = rc_directory / ".nwsm-migrated";
+    const fs::path desktop_runlevel = *config_home / "rc" / "runlevels" / "desktop";
     std::error_code error;
     fs::create_directories(desktop_runlevel, error);
     if (error) {
-        log_message("cannot create the user OpenRC configuration directory: " + error.message());
+        log_message("cannot create the user OpenRC desktop runlevel: " + error.message());
         return false;
     }
+
+    const auto services = installed_user_services();
+    if (!services.has_value())
+        return false;
 
     const std::string rc_update = resolve_executable("rc-update");
     if (rc_update.empty()) {
@@ -1137,88 +1152,13 @@ bool migrate_existing_user()
     }
 
     bool success = true;
-    for (const std::string& service : managed_user_services()) {
-        const fs::path expected_target = fs::path("/etc/user/init.d") / service;
-        std::error_code entry_error;
-        if (!fs::is_regular_file(expected_target, entry_error) || entry_error) {
-            log_message("the user service definition " + expected_target.string() + " is unavailable");
-            success = false;
-            continue;
-        }
-
-        const fs::path destination = desktop_runlevel / service;
-        entry_error.clear();
-        const fs::file_status destination_status = fs::symlink_status(destination, entry_error);
-        const bool destination_missing = entry_error == std::errc::no_such_file_or_directory
-            || destination_status.type() == fs::file_type::not_found;
-        if (entry_error && !destination_missing) {
-            log_message("cannot inspect the user service entry " + service + ": " + entry_error.message());
-            success = false;
-            continue;
-        }
-
-        if (!destination_missing) {
-            bool destination_matches = false;
-            bool replace_managed_link = false;
-            if (fs::is_symlink(destination_status)) {
-                entry_error.clear();
-                destination_matches = fs::equivalent(destination, expected_target, entry_error);
-                entry_error.clear();
-                const fs::path target = fs::read_symlink(destination, entry_error);
-                if (!entry_error) {
-                    const fs::path target_parent = target.parent_path();
-                    replace_managed_link = target == expected_target
-                        || (target.filename() == service
-                            && target_parent.filename() == "init.d"
-                            && target_parent.parent_path().filename() == "user");
-                }
-            }
-
-            if (destination_matches)
-                continue;
-            if (!replace_managed_link) {
-                log_message("preserving the customized user service entry " + service);
-                continue;
-            }
-
-            entry_error.clear();
-            if (!fs::remove(destination, entry_error) || entry_error) {
-                log_message("could not replace the legacy user service link " + service
-                    + (entry_error ? ": " + entry_error.message() : ""));
-                success = false;
-                continue;
-            }
-        }
-
+    for (const std::string& service : *services) {
         if (run_command({rc_update, "-U", "add", service, "desktop"}) != 0) {
             log_message("could not add the user service " + service + " to the desktop runlevel");
             success = false;
         }
     }
-
-    if (!success)
-        return false;
-
-    error.clear();
-    const fs::file_status marker_status = fs::symlink_status(marker, error);
-    if (!error && marker_status.type() == fs::file_type::regular)
-        return true;
-    if (error && error != std::errc::no_such_file_or_directory) {
-        log_message("cannot inspect the existing-user migration marker: " + error.message());
-        return false;
-    }
-    if (!error && marker_status.type() != fs::file_type::not_found) {
-        log_message("the existing-user migration marker is not a regular file");
-        return false;
-    }
-
-    ScopedFd marker_file(::open(marker.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600));
-    if (!marker_file.valid()) {
-        log_message("could not create the existing-user migration marker: " + std::string(std::strerror(errno)));
-        return false;
-    }
-    constexpr char marker_text[] = "Migrated by nwsm.\n";
-    return write_all(marker_file.get(), marker_text, sizeof(marker_text) - 1);
+    return success;
 }
 
 bool set_session_environment()
@@ -1446,8 +1386,8 @@ int main(int argc, char** argv)
 
     if (!stop_desktop_runlevel())
         log_message("stale user services could not be fully reconciled; continuing session startup");
-    if (!migrate_existing_user())
-        log_message("existing-user service migration was incomplete; continuing session startup");
+    if (!register_user_services())
+        log_message("user service registration was incomplete; continuing session startup");
     if (!remove_finalization_file(*runtime_directory))
         log_message("could not remove a stale compositor environment handoff; continuing session startup");
 
