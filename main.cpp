@@ -31,6 +31,8 @@
 #include <unistd.h>
 #include <vector>
 
+extern char** environ;
+
 namespace {
 
 namespace fs = std::filesystem;
@@ -679,15 +681,9 @@ bool is_safe_component(const std::string& value)
     return true;
 }
 
-constexpr const char* finalization_environment_names[] = {
+constexpr const char* base_finalization_environment_names[] = {
     "DISPLAY",
     "WAYLAND_DISPLAY",
-    "XDG_CURRENT_DESKTOP",
-    "XDG_SESSION_DESKTOP",
-    "XDG_SESSION_TYPE",
-    "XDG_SEAT",
-    "XDG_SEAT_PATH",
-    "XDG_VTNR",
     "ELECTRON_OZONE_PLATFORM_HINT",
     "GDK_BACKEND",
     "GTK_USE_PORTAL",
@@ -704,13 +700,63 @@ constexpr const char* finalization_environment_names[] = {
 };
 
 
+bool is_safe_environment_name(const std::string& name)
+{
+    if (name.empty() || name.size() > 255)
+        return false;
+
+    const auto valid_first = [](unsigned char character) {
+        return (character >= 65 && character <= 90)
+            || (character >= 97 && character <= 122)
+            || character == 95;
+    };
+    if (!valid_first(static_cast<unsigned char>(name.front())))
+        return false;
+
+    for (const unsigned char character : name) {
+        if (!valid_first(character) && !(character >= 48 && character <= 57))
+            return false;
+    }
+    return true;
+}
+
+bool is_xdg_environment_name(const std::string& name)
+{
+    return name.size() > 4
+        && name.compare(0, 4, "XDG_") == 0
+        && is_safe_environment_name(name);
+}
+
 bool is_finalization_environment_name(const std::string& name)
 {
-    for (const char* allowed : finalization_environment_names) {
+    if (is_xdg_environment_name(name))
+        return true;
+
+    for (const char* allowed : base_finalization_environment_names) {
         if (name == allowed)
             return true;
     }
     return false;
+}
+
+std::vector<std::string> current_finalization_environment_names()
+{
+    std::vector<std::string> names;
+    for (const char* const* entry = base_finalization_environment_names; *entry != nullptr; ++entry)
+        names.emplace_back(*entry);
+
+    for (char** entry = environ; entry != nullptr && *entry != nullptr; ++entry) {
+        const char* separator = std::strchr(*entry, '=');
+        if (separator == nullptr)
+            continue;
+        const std::string name(*entry, static_cast<std::size_t>(separator - *entry));
+        if (is_xdg_environment_name(name))
+            names.push_back(name);
+    }
+
+    std::sort(names.begin(), names.end());
+    names.erase(std::unique(names.begin(), names.end()), names.end());
+    return names;
 }
 
 const std::string* finalized_value(
@@ -872,8 +918,8 @@ bool write_finalization_file()
 
     std::string content;
     bool has_wayland_display = false;
-    for (const char* name : finalization_environment_names) {
-        if (const char* value = std::getenv(name); value != nullptr) {
+    for (const std::string& name : current_finalization_environment_names()) {
+        if (const char* value = std::getenv(name.c_str()); value != nullptr) {
             if (std::strpbrk(value, "\r\n") != nullptr) {
                 log_message("cannot finalize an environment containing a newline");
                 return false;
@@ -972,19 +1018,10 @@ std::optional<CompositorReadiness> wait_for_compositor_readiness(
     return std::nullopt;
 }
 
-constexpr const char* activation_environment_names[] = {
+constexpr const char* base_activation_environment_names[] = {
     "DBUS_SESSION_BUS_ADDRESS",
     "DISPLAY",
     "WAYLAND_DISPLAY",
-    "XDG_CURRENT_DESKTOP",
-    "XDG_SESSION_DESKTOP",
-    "XDG_SESSION_TYPE",
-    "XDG_SEAT",
-    "XDG_SEAT_PATH",
-    "XDG_VTNR",
-    "XDG_RUNTIME_DIR",
-    "XDG_DATA_DIRS",
-    "XDG_CONFIG_DIRS",
     "HOME",
     "PATH",
     "ELECTRON_OZONE_PLATFORM_HINT",
@@ -1002,11 +1039,38 @@ constexpr const char* activation_environment_names[] = {
     "HYPRCURSOR_THEME",
 };
 
+std::vector<std::string> activation_environment_names(const EnvironmentSnapshot* previous = nullptr)
+{
+    std::vector<std::string> names;
+    for (const char* const* entry = base_activation_environment_names; *entry != nullptr; ++entry)
+        names.emplace_back(*entry);
+
+    for (char** entry = environ; entry != nullptr && *entry != nullptr; ++entry) {
+        const char* separator = std::strchr(*entry, '=');
+        if (separator == nullptr)
+            continue;
+        const std::string name(*entry, static_cast<std::size_t>(separator - *entry));
+        if (is_xdg_environment_name(name))
+            names.push_back(name);
+    }
+
+    if (previous != nullptr) {
+        for (const auto& [name, value] : *previous) {
+            if (is_xdg_environment_name(name))
+                names.push_back(name);
+        }
+    }
+
+    std::sort(names.begin(), names.end());
+    names.erase(std::unique(names.begin(), names.end()), names.end());
+    return names;
+}
+
 EnvironmentSnapshot snapshot_activation_environment()
 {
     EnvironmentSnapshot snapshot;
-    for (const char* name : activation_environment_names) {
-        if (const char* value = std::getenv(name); value != nullptr)
+    for (const std::string& name : activation_environment_names()) {
+        if (const char* value = std::getenv(name.c_str()); value != nullptr)
             snapshot.emplace_back(name, value);
     }
     return snapshot;
@@ -1030,9 +1094,9 @@ bool update_activation_environment()
     }
 
     std::vector<std::string> arguments{updater};
-    for (const char* name : activation_environment_names) {
-        const char* value = std::getenv(name);
-        arguments.emplace_back(std::string(name) + "=" + (value == nullptr ? "" : value));
+    for (const std::string& name : activation_environment_names()) {
+        const char* value = std::getenv(name.c_str());
+        arguments.emplace_back(name + "=" + (value == nullptr ? "" : value));
     }
     if (run_command(arguments) != 0) {
         log_message("could not update the session D-Bus activation environment");
@@ -1048,9 +1112,9 @@ void restore_activation_environment(const EnvironmentSnapshot& snapshot)
         return;
 
     std::vector<std::string> arguments{updater};
-    for (const char* name : activation_environment_names) {
-        const std::string* value = snapshot_value(snapshot, name);
-        arguments.emplace_back(std::string(name) + "=" + (value == nullptr ? "" : *value));
+    for (const std::string& name : activation_environment_names(&snapshot)) {
+        const std::string* value = snapshot_value(snapshot, name.c_str());
+        arguments.emplace_back(name + "=" + (value == nullptr ? "" : *value));
     }
     run_command(arguments, true);
 }
@@ -1312,9 +1376,6 @@ bool set_session_environment()
         {"HYPRCURSOR_THEME", "nitrux_snow_cursors"},
         {"XCURSOR_SIZE", "24"},
         {"XCURSOR_THEME", "nitrux_snow_cursors"},
-        {"XDG_CURRENT_DESKTOP", "Hyprland"},
-        {"XDG_SESSION_DESKTOP", "Hyprland"},
-        {"XDG_SESSION_TYPE", "wayland"},
     };
 
     bool success = true;
