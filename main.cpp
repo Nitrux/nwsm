@@ -43,6 +43,10 @@ constexpr std::chrono::milliseconds poll_interval{100};
 constexpr std::chrono::seconds default_ready_timeout{60};
 constexpr std::chrono::seconds default_finalize_grace{1};
 constexpr const char* finalization_file_name = "nwsm.finalize";
+constexpr const char* service_registration_marker_name = ".nwsm-services-registered";
+constexpr const char* service_registration_marker_header = "nwsm-service-registration-v1";
+constexpr const char* legacy_service_registration_marker = "Registered by nwsm.\n";
+constexpr const char* legacy_service_registration_entry = "__nwsm_legacy_registration__";
 
 struct SocketIdentity {
     dev_t device{};
@@ -1113,6 +1117,96 @@ std::optional<std::vector<std::string>> installed_user_services()
     return services;
 }
 
+std::optional<std::set<std::string>> read_service_registration_marker(const fs::path& marker)
+{
+    ScopedFd file(::open(marker.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+    if (!file.valid()) {
+        log_message("could not open the user service registration marker: " + std::string(std::strerror(errno)));
+        return std::nullopt;
+    }
+
+    struct stat status {};
+    if (::fstat(file.get(), &status) != 0 || !S_ISREG(status.st_mode)
+        || status.st_uid != ::geteuid() || (status.st_mode & 0077) != 0
+        || status.st_size < 1 || status.st_size > 65536) {
+        log_message("the user service registration marker is invalid");
+        return std::nullopt;
+    }
+
+    std::string content(static_cast<std::size_t>(status.st_size), static_cast<char>(0));
+    std::size_t received = 0;
+    while (received < content.size()) {
+        const ssize_t result = ::read(file.get(), content.data() + received, content.size() - received);
+        if (result > 0) {
+            received += static_cast<std::size_t>(result);
+            continue;
+        }
+        if (result < 0 && errno == EINTR)
+            continue;
+        log_message("could not read the user service registration marker");
+        return std::nullopt;
+    }
+
+    if (content == legacy_service_registration_marker)
+        return std::set<std::string>{legacy_service_registration_entry};
+
+    const std::size_t header_end = content.find(static_cast<char>(10));
+    if (header_end == std::string::npos
+        || content.substr(0, header_end) != service_registration_marker_header) {
+        log_message("the user service registration marker has an unsupported format");
+        return std::nullopt;
+    }
+
+    std::set<std::string> services;
+    std::size_t begin = header_end + 1;
+    while (begin < content.size()) {
+        const std::size_t end = content.find(static_cast<char>(10), begin);
+        const std::size_t line_end = end == std::string::npos ? content.size() : end;
+        const std::string service = content.substr(begin, line_end - begin);
+        if (!service.empty() && service.find_first_of(static_cast<char>(13)) != std::string::npos) {
+            log_message("the user service registration marker contains an invalid service name");
+            return std::nullopt;
+        }
+        if (!service.empty())
+            services.insert(service);
+        if (end == std::string::npos)
+            break;
+        begin = end + 1;
+    }
+    return services;
+}
+
+bool write_service_registration_marker(const fs::path& marker, const std::set<std::string>& services)
+{
+    std::string content = std::string(service_registration_marker_header) + "\n";
+    for (const std::string& service : services)
+        content += service + "\n";
+    if (content.size() > 65536) {
+        log_message("the user service registration marker is too large");
+        return false;
+    }
+
+    const fs::path temporary = marker.string() + "." + std::to_string(::getpid());
+    ScopedFd file(::open(temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600));
+    if (!file.valid()) {
+        log_message("could not create the user service registration marker: " + std::string(std::strerror(errno)));
+        return false;
+    }
+
+    if (!write_all(file.get(), content.data(), content.size()) || ::fsync(file.get()) != 0) {
+        ::unlink(temporary.c_str());
+        log_message("could not write the user service registration marker");
+        return false;
+    }
+
+    if (::rename(temporary.c_str(), marker.c_str()) != 0) {
+        ::unlink(temporary.c_str());
+        log_message("could not publish the user service registration marker: " + std::string(std::strerror(errno)));
+        return false;
+    }
+    return true;
+}
+
 bool register_user_services()
 {
     const auto config_home = [&]() -> std::optional<fs::path> {
@@ -1133,7 +1227,9 @@ bool register_user_services()
         return false;
     }
 
-    const fs::path desktop_runlevel = *config_home / "rc" / "runlevels" / "desktop";
+    const fs::path rc_directory = *config_home / "rc";
+    const fs::path desktop_runlevel = rc_directory / "runlevels" / "desktop";
+    const fs::path marker = rc_directory / service_registration_marker_name;
     std::error_code error;
     fs::create_directories(desktop_runlevel, error);
     if (error) {
@@ -1141,9 +1237,34 @@ bool register_user_services()
         return false;
     }
 
+    error.clear();
+    const fs::file_status marker_status = fs::symlink_status(marker, error);
+    const bool marker_missing = error == std::errc::no_such_file_or_directory
+        || marker_status.type() == fs::file_type::not_found;
+    if (error && !marker_missing) {
+        log_message("cannot inspect the user service registration marker: " + error.message());
+        return false;
+    }
+    if (!marker_missing && !fs::is_regular_file(marker_status)) {
+        log_message("the user service registration marker is not a regular file");
+        return false;
+    }
+
+    std::set<std::string> registered_services;
+    if (!marker_missing) {
+        const auto registered = read_service_registration_marker(marker);
+        if (!registered.has_value())
+            return false;
+        registered_services = *registered;
+    }
+
     const auto services = installed_user_services();
     if (!services.has_value())
         return false;
+
+    const bool legacy_marker = registered_services.contains(legacy_service_registration_entry);
+    if (legacy_marker)
+        registered_services.clear();
 
     const std::string rc_update = resolve_executable("rc-update");
     if (rc_update.empty()) {
@@ -1151,14 +1272,24 @@ bool register_user_services()
         return false;
     }
 
-    bool success = true;
+    if (legacy_marker) {
+        for (const std::string& service : *services)
+            registered_services.insert(service);
+    }
+
+    bool marker_changed = marker_missing || legacy_marker;
     for (const std::string& service : *services) {
+        if (registered_services.contains(service))
+            continue;
         if (run_command({rc_update, "-U", "add", service, "desktop"}) != 0) {
             log_message("could not add the user service " + service + " to the desktop runlevel");
-            success = false;
+            return false;
         }
+        registered_services.insert(service);
+        marker_changed = true;
     }
-    return success;
+
+    return !marker_changed || write_service_registration_marker(marker, registered_services);
 }
 
 bool set_session_environment()

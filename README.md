@@ -2,7 +2,7 @@
 
 # Introduction
 
-`nwsm` is a small Wayland session lifecycle manager for OpenRC user services.
+`nwsm` is a Nitrux Hyprland session lifecycle manager for OpenRC user services.
 
 It starts the supplied Wayland session command, waits for a verified Wayland socket, and activates the OpenRC user `desktop` runlevel.
 
@@ -14,7 +14,8 @@ OpenRC remains responsible for supervising long-running user services. `nwsm` bi
 - Publishes manager-discovered compositor state automatically; `nwsm finalize` optionally adds compositor-provided variables.
 - Activates and shuts down the OpenRC user `desktop` runlevel.
 - Refreshes Wayland, compositor, and D-Bus environment after compositor replacement.
-- Registers installed OpenRC user services through `rc-update -U` without overwriting custom services or blocking the graphical session.
+- Bootstraps installed OpenRC user services through `rc-update -U`, records the enrolled services, and preserves later user changes.
+- Detects newly installed service definitions without re-enrolling services removed by the user.
 - Reconciles stale user services before startup and restores the previous activation environment at shutdown.
 - Provides `check`, `status`, and `stop` lifecycle controls.
 - Stops the OpenRC runlevel and removes stale handoff data on exit.
