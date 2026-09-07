@@ -681,6 +681,7 @@ bool is_safe_component(const std::string& value)
     return true;
 }
 
+// These arrays are intentionally sentinel-free; iterate them with range-for.
 constexpr const char* base_finalization_environment_names[] = {
     "DISPLAY",
     "WAYLAND_DISPLAY",
@@ -727,9 +728,14 @@ bool is_xdg_environment_name(const std::string& name)
         && is_safe_environment_name(name);
 }
 
+bool is_session_xdg_environment_name(const std::string& name)
+{
+    return is_xdg_environment_name(name) && name != "XDG_ACTIVATION_TOKEN";
+}
+
 bool is_finalization_environment_name(const std::string& name)
 {
-    if (is_xdg_environment_name(name))
+    if (is_session_xdg_environment_name(name))
         return true;
 
     for (const char* allowed : base_finalization_environment_names) {
@@ -742,15 +748,15 @@ bool is_finalization_environment_name(const std::string& name)
 std::vector<std::string> current_finalization_environment_names()
 {
     std::vector<std::string> names;
-    for (const char* const* entry = base_finalization_environment_names; *entry != nullptr; ++entry)
-        names.emplace_back(*entry);
+    for (const char* entry : base_finalization_environment_names)
+        names.emplace_back(entry);
 
     for (char** entry = environ; entry != nullptr && *entry != nullptr; ++entry) {
         const char* separator = std::strchr(*entry, '=');
         if (separator == nullptr)
             continue;
         const std::string name(*entry, static_cast<std::size_t>(separator - *entry));
-        if (is_xdg_environment_name(name))
+        if (is_session_xdg_environment_name(name))
             names.push_back(name);
     }
 
@@ -1018,6 +1024,7 @@ std::optional<CompositorReadiness> wait_for_compositor_readiness(
     return std::nullopt;
 }
 
+// These arrays are intentionally sentinel-free; iterate them with range-for.
 constexpr const char* base_activation_environment_names[] = {
     "DBUS_SESSION_BUS_ADDRESS",
     "DISPLAY",
@@ -1042,21 +1049,21 @@ constexpr const char* base_activation_environment_names[] = {
 std::vector<std::string> activation_environment_names(const EnvironmentSnapshot* previous = nullptr)
 {
     std::vector<std::string> names;
-    for (const char* const* entry = base_activation_environment_names; *entry != nullptr; ++entry)
-        names.emplace_back(*entry);
+    for (const char* entry : base_activation_environment_names)
+        names.emplace_back(entry);
 
     for (char** entry = environ; entry != nullptr && *entry != nullptr; ++entry) {
         const char* separator = std::strchr(*entry, '=');
         if (separator == nullptr)
             continue;
         const std::string name(*entry, static_cast<std::size_t>(separator - *entry));
-        if (is_xdg_environment_name(name))
+        if (is_session_xdg_environment_name(name))
             names.push_back(name);
     }
 
     if (previous != nullptr) {
         for (const auto& [name, value] : *previous) {
-            if (is_xdg_environment_name(name))
+            if (is_session_xdg_environment_name(name))
                 names.push_back(name);
         }
     }
@@ -1085,6 +1092,24 @@ const std::string* snapshot_value(const EnvironmentSnapshot& snapshot, const cha
     return nullptr;
 }
 
+std::vector<std::string> activation_environment_arguments(
+    const std::string& updater,
+    const EnvironmentSnapshot* previous = nullptr)
+{
+    std::vector<std::string> arguments{updater};
+    for (const std::string& name : activation_environment_names(previous)) {
+        if (previous != nullptr) {
+            const std::string* value = snapshot_value(*previous, name.c_str());
+            arguments.emplace_back(name + "=" + (value == nullptr ? "" : *value));
+            continue;
+        }
+
+        const char* value = std::getenv(name.c_str());
+        arguments.emplace_back(name + "=" + (value == nullptr ? "" : value));
+    }
+    return arguments;
+}
+
 bool update_activation_environment()
 {
     const std::string updater = resolve_executable("dbus-update-activation-environment");
@@ -1093,12 +1118,7 @@ bool update_activation_environment()
         return false;
     }
 
-    std::vector<std::string> arguments{updater};
-    for (const std::string& name : activation_environment_names()) {
-        const char* value = std::getenv(name.c_str());
-        arguments.emplace_back(name + "=" + (value == nullptr ? "" : value));
-    }
-    if (run_command(arguments) != 0) {
+    if (run_command(activation_environment_arguments(updater)) != 0) {
         log_message("could not update the session D-Bus activation environment");
         return false;
     }
@@ -1111,12 +1131,7 @@ void restore_activation_environment(const EnvironmentSnapshot& snapshot)
     if (updater.empty())
         return;
 
-    std::vector<std::string> arguments{updater};
-    for (const std::string& name : activation_environment_names(&snapshot)) {
-        const std::string* value = snapshot_value(snapshot, name.c_str());
-        arguments.emplace_back(name + "=" + (value == nullptr ? "" : *value));
-    }
-    run_command(arguments, true);
+    run_command(activation_environment_arguments(updater, &snapshot), true);
 }
 
 bool activate_desktop_runlevel(bool& attempted)
@@ -1151,9 +1166,8 @@ bool stop_desktop_runlevel()
     return true;
 }
 
-std::optional<std::vector<std::string>> installed_user_services()
+std::optional<std::vector<std::string>> installed_user_services(const fs::path& init_directory = "/etc/user/init.d")
 {
-    const fs::path init_directory = "/etc/user/init.d";
     std::error_code error;
     if (!fs::is_directory(init_directory, error)) {
         log_message("the OpenRC user service directory is unavailable"
@@ -1277,6 +1291,18 @@ bool write_service_registration_marker(const fs::path& marker, const std::set<st
     return true;
 }
 
+std::set<std::string> services_requiring_registration(
+    const std::vector<std::string>& services,
+    const std::set<std::string>& registered_services)
+{
+    std::set<std::string> pending;
+    for (const std::string& service : services) {
+        if (!registered_services.contains(service))
+            pending.insert(service);
+    }
+    return pending;
+}
+
 bool register_user_services()
 {
     const auto config_home = [&]() -> std::optional<fs::path> {
@@ -1348,9 +1374,7 @@ bool register_user_services()
     }
 
     bool marker_changed = marker_missing || legacy_marker;
-    for (const std::string& service : *services) {
-        if (registered_services.contains(service))
-            continue;
+    for (const std::string& service : services_requiring_registration(*services, registered_services)) {
         if (run_command({rc_update, "-U", "add", service, "desktop"}) != 0) {
             log_message("could not add the user service " + service + " to the desktop runlevel");
             return false;
