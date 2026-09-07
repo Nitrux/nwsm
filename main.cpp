@@ -80,6 +80,14 @@ struct CompositorReadiness {
 
 using EnvironmentSnapshot = std::vector<std::pair<std::string, std::string>>;
 
+#ifdef NWSM_TESTING
+using TestCommandRunner = int (*)(const std::vector<std::string>&, bool);
+using TestExecutableResolver = std::string (*)(const std::string&);
+TestCommandRunner test_command_runner = nullptr;
+TestExecutableResolver test_executable_resolver = nullptr;
+fs::path test_user_service_directory;
+#endif
+
 class ScopedFd {
 public:
     explicit ScopedFd(int fd = -1)
@@ -236,6 +244,11 @@ std::optional<ScopedFd> acquire_instance_lock(const RuntimeDirectory& runtime)
 
 std::string resolve_executable(const std::string& executable)
 {
+#ifdef NWSM_TESTING
+    if (test_executable_resolver != nullptr)
+        return test_executable_resolver(executable);
+#endif
+
     const auto is_trusted_executable = [](const fs::path& path) {
         struct stat status {};
         if (::stat(path.c_str(), &status) != 0 || !S_ISREG(status.st_mode))
@@ -352,6 +365,11 @@ int wait_for_process(pid_t pid)
 
 int run_command(const std::vector<std::string>& arguments, bool quiet = false)
 {
+#ifdef NWSM_TESTING
+    if (test_command_runner != nullptr)
+        return test_command_runner(arguments, quiet);
+#endif
+
     const auto pid = spawn(arguments, quiet);
     return pid.has_value() ? wait_for_process(*pid) : 127;
 }
@@ -1166,7 +1184,7 @@ bool stop_desktop_runlevel()
     return true;
 }
 
-std::optional<std::vector<std::string>> installed_user_services(const fs::path& init_directory = "/etc/user/init.d")
+std::optional<std::vector<std::string>> installed_user_services(const fs::path& init_directory)
 {
     std::error_code error;
     if (!fs::is_directory(init_directory, error)) {
@@ -1199,6 +1217,15 @@ std::optional<std::vector<std::string>> installed_user_services(const fs::path& 
 
     std::sort(services.begin(), services.end());
     return services;
+}
+
+std::optional<std::vector<std::string>> installed_user_services()
+{
+#ifdef NWSM_TESTING
+    if (!test_user_service_directory.empty())
+        return installed_user_services(test_user_service_directory);
+#endif
+    return installed_user_services("/etc/user/init.d");
 }
 
 std::optional<std::set<std::string>> read_service_registration_marker(const fs::path& marker)
