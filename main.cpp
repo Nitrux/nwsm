@@ -1136,7 +1136,7 @@ bool update_activation_environment()
         return false;
     }
 
-    if (run_command(activation_environment_arguments(updater)) != 0) {
+    if (run_command(activation_environment_arguments(updater), true) != 0) {
         log_message("could not update the session D-Bus activation environment");
         return false;
     }
@@ -1162,7 +1162,7 @@ bool activate_desktop_runlevel(bool& attempted)
     }
 
     attempted = true;
-    if (run_command({openrc, "-U", "desktop"}) != 0) {
+    if (run_command({openrc, "-U", "desktop"}, true) != 0) {
         log_message("could not activate the desktop user runlevel");
         return false;
     }
@@ -1177,7 +1177,7 @@ bool stop_desktop_runlevel()
         return false;
     }
 
-    if (run_command({openrc, "-U", "shutdown"}) != 0) {
+    if (run_command({openrc, "-U", "shutdown"}, true) != 0) {
         log_message("could not stop the desktop user runlevel");
         return false;
     }
@@ -1402,7 +1402,7 @@ bool register_user_services()
 
     bool marker_changed = marker_missing || legacy_marker;
     for (const std::string& service : services_requiring_registration(*services, registered_services)) {
-        if (run_command({rc_update, "-U", "add", service, "desktop"}) != 0) {
+        if (run_command({rc_update, "-U", "add", service, "desktop"}, true) != 0) {
             log_message("could not add the user service " + service + " to the desktop runlevel");
             return false;
         }
@@ -1650,7 +1650,7 @@ int main(int argc, char** argv)
     for (int index = session_argument_start; index < argc; ++index)
         session_arguments.emplace_back(argv[index]);
 
-    const auto session_process = spawn(session_arguments, false, true);
+    const auto session_process = spawn(session_arguments, true, true);
     if (!session_process.has_value()) {
         restore_activation_environment(activation_environment);
         return 1;
