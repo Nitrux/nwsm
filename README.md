@@ -6,7 +6,7 @@
 
 It starts the supplied Wayland session command, waits for a verified Wayland socket, and activates the OpenRC user `desktop` runlevel.
 
-OpenRC remains responsible for supervising long-running user services. `nwsm` binds those services to the authenticated graphical session, publishes the compositor environment, and refreshes it when the session creates a replacement Wayland socket.
+OpenRC remains responsible for supervising long-running user services. `nwsm` binds those services to the authenticated graphical session, publishes the compositor environment, and refreshes it when the session creates a replacement Wayland socket. The session supervisor remains active across compositor replacement and restarts the supplied Wayland session command when it exits.
 
 ## Features
 
@@ -18,7 +18,8 @@ OpenRC remains responsible for supervising long-running user services. `nwsm` bi
 - Detects newly installed service definitions without re-enrolling services removed by the user.
 - Reconciles stale user services before startup and restores the previous activation environment at shutdown.
 - Provides `check`, `status`, and `stop` lifecycle controls.
-- Stops the OpenRC runlevel and removes stale handoff data on exit.
+- Retains the authenticated session across compositor replacement and rehydrates the OpenRC user `desktop` runlevel.
+- Stops the OpenRC runlevel and removes stale handoff data on intentional session exit.
 
 ## System Requirements
 
@@ -39,7 +40,7 @@ nwsm -- <wayland-session-command> [arguments...]
 ```
 
 > [!NOTE]
-> Readiness defaults to 60 seconds. Optional finalization has a one-second grace period and is never required for startup. Set `NWSM_READY_TIMEOUT` or `NWSM_FINALIZE_GRACE` to adjust them. Comma- or space-separate manager-discovered requirements such as `HYPRLAND_INSTANCE_SIGNATURE` in `NWSM_REQUIRED_VARS`.
+> Readiness defaults to 60 seconds. Optional finalization has a one-second grace period and is never required for startup. Set `NWSM_READY_TIMEOUT` or `NWSM_FINALIZE_GRACE` to adjust them. Comma- or space-separate manager-discovered requirements such as `HYPRLAND_INSTANCE_SIGNATURE` in `NWSM_REQUIRED_VARS`. Session-command restart is enabled by default; set `NWSM_RESTART_ON_EXIT=0` to disable it.
 
 # Licensing
 

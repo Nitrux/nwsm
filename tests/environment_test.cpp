@@ -415,6 +415,36 @@ void test_failed_readiness()
     ::rmdir(directory_name);
 }
 
+void test_restart_policy()
+{
+    ::unsetenv("NWSM_RESTART_ON_EXIT");
+    require(restart_session_on_exit(), "session restart should be enabled by default");
+    ::setenv("NWSM_RESTART_ON_EXIT", "0", 1);
+    require(!restart_session_on_exit(), "session restart should be disableable");
+    ::setenv("NWSM_RESTART_ON_EXIT", "false", 1);
+    require(!restart_session_on_exit(), "false should disable session restart");
+    ::setenv("NWSM_RESTART_ON_EXIT", "yes", 1);
+    require(restart_session_on_exit(), "yes should enable session restart");
+    ::unsetenv("NWSM_RESTART_ON_EXIT");
+}
+
+void test_reaped_session_process_release()
+{
+    ChildState child;
+    child.reaped = true;
+    session_process_pid = 123;
+    session_process_pgid = ::getpgrp();
+
+    release_reaped_session_process(child);
+
+    require(session_process_pid == -1 && session_process_pgid == -1,
+        "reaped session process tracking was not released");
+    require(std::find(retained_session_process_groups.begin(), retained_session_process_groups.end(), ::getpgrp())
+            != retained_session_process_groups.end(),
+        "surviving session process group was not retained for logout");
+    retained_session_process_groups.clear();
+}
+
 void test_session_lifecycle()
 {
     char directory_template[] = "/tmp/nwsm-lifecycle-test.XXXXXX";
@@ -440,6 +470,7 @@ void test_session_lifecycle()
     ::setenv("XDG_RUNTIME_DIR", runtime.c_str(), 1);
     ::setenv("XDG_CONFIG_HOME", config_home.c_str(), 1);
     ::setenv("NWSM_FINALIZE_GRACE", "0", 1);
+    ::setenv("NWSM_RESTART_ON_EXIT", "0", 1);
     ::unsetenv("DISPLAY");
     ::unsetenv("WAYLAND_DISPLAY");
     ::unsetenv("HYPRLAND_INSTANCE_SIGNATURE");
@@ -471,6 +502,7 @@ void test_session_lifecycle()
         "session lifecycle did not restore the activation environment");
 
     ::unsetenv("NWSM_FINALIZE_GRACE");
+    ::unsetenv("NWSM_RESTART_ON_EXIT");
     std::filesystem::remove_all(directory_name);
 }
 
@@ -487,6 +519,8 @@ int main(int argc, char** argv)
         test_service_registration_lifecycle();
         test_service_marker_migration();
         test_finalization_file_validation();
+        test_restart_policy();
+        test_reaped_session_process_release();
         test_wayland_socket_replacement();
         test_failed_readiness();
         test_session_lifecycle();

@@ -40,6 +40,7 @@ namespace fs = std::filesystem;
 volatile std::sig_atomic_t stop_requested = 0;
 volatile std::sig_atomic_t session_process_pid = -1;
 volatile std::sig_atomic_t session_process_pgid = -1;
+std::vector<pid_t> retained_session_process_groups;
 
 constexpr std::chrono::milliseconds poll_interval{100};
 constexpr std::chrono::seconds default_ready_timeout{60};
@@ -449,6 +450,52 @@ void terminate_session_process(ChildState& child)
     }
     session_process_pid = -1;
     session_process_pgid = -1;
+}
+
+// Once the child has been reaped, its process group may still contain
+// applications that outlived the compositor. Retain that group for explicit
+// logout, but do not terminate it during compositor recovery.
+void release_reaped_session_process(ChildState& child)
+{
+    if (!child.reaped)
+        return;
+
+    const pid_t process_group = static_cast<pid_t>(session_process_pgid);
+    if (process_group > 0 && process_group_exists(process_group)
+        && std::find(retained_session_process_groups.begin(), retained_session_process_groups.end(), process_group)
+            == retained_session_process_groups.end()) {
+        retained_session_process_groups.push_back(process_group);
+    }
+    session_process_pid = -1;
+    session_process_pgid = -1;
+}
+
+void terminate_retained_session_process_groups()
+{
+    for (const pid_t process_group : retained_session_process_groups) {
+        if (process_group_exists(process_group))
+            ::kill(-process_group, SIGTERM);
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline) {
+        bool group_alive = false;
+        for (const pid_t process_group : retained_session_process_groups) {
+            if (process_group_exists(process_group)) {
+                group_alive = true;
+                break;
+            }
+        }
+        if (!group_alive)
+            break;
+        std::this_thread::sleep_for(poll_interval);
+    }
+
+    for (const pid_t process_group : retained_session_process_groups) {
+        if (process_group_exists(process_group))
+            ::kill(-process_group, SIGKILL);
+    }
+    retained_session_process_groups.clear();
 }
 
 std::optional<SocketIdentity> socket_identity(const fs::path& path)
@@ -1012,6 +1059,15 @@ std::chrono::seconds readiness_timeout()
     if (errno == 0 && end != value->c_str() && *end == '\0' && seconds > 0 && seconds <= 600)
         return std::chrono::seconds(seconds);
     return default_ready_timeout;
+}
+
+bool restart_session_on_exit()
+{
+    const auto value = environment_value("NWSM_RESTART_ON_EXIT");
+    if (!value.has_value())
+        return true;
+
+    return *value != "0" && *value != "false" && *value != "no";
 }
 
 std::optional<CompositorReadiness> wait_for_compositor_readiness(
@@ -1650,15 +1706,22 @@ int main(int argc, char** argv)
     for (int index = session_argument_start; index < argc; ++index)
         session_arguments.emplace_back(argv[index]);
 
-    const auto session_process = spawn(session_arguments, true, true);
-    if (!session_process.has_value()) {
+    ChildState child;
+    const auto spawn_session = [&]() {
+        const auto session_process = spawn(session_arguments, true, true);
+        if (!session_process.has_value())
+            return false;
+
+        child = ChildState{*session_process};
+        session_process_pid = child.pid;
+        session_process_pgid = child.pid;
+        return true;
+    };
+
+    if (!spawn_session()) {
         restore_activation_environment(activation_environment);
         return 1;
     }
-
-    ChildState child{*session_process};
-    session_process_pid = child.pid;
-    session_process_pgid = child.pid;
 
     const auto timeout = readiness_timeout();
     const auto finalize_grace = finalization_grace();
@@ -1691,7 +1754,9 @@ int main(int argc, char** argv)
     const auto initial_readiness = wait_for_compositor_readiness(
         runtime, all_wayland_sockets, all_hyprland_signatures, child, timeout);
     if (!initial_readiness.has_value() || !publish_readiness(*initial_readiness)) {
-        if (!child.reaped)
+        if (child.reaped && !stop_requested)
+            release_reaped_session_process(child);
+        else
             terminate_session_process(child);
         if (activation_environment_changed)
             restore_activation_environment(activation_environment);
@@ -1707,10 +1772,66 @@ int main(int argc, char** argv)
         log_message("desktop user services could not be fully activated; continuing the graphical session");
 
     CompositorReadiness active_readiness = *initial_readiness;
-    while (!stop_requested && !child.reaped) {
+    const auto recover_compositor = [&]() {
+        if (desktop_runlevel_active) {
+            if (!stop_desktop_runlevel())
+                log_message("desktop user services did not stop cleanly before compositor replacement; continuing recovery");
+            desktop_runlevel_active = false;
+        }
+        if (!remove_finalization_file(*runtime_directory))
+            log_message("could not remove the previous compositor environment handoff");
+
+        if (child.reaped) {
+            if (stop_requested) {
+                terminate_session_process(child);
+                return false;
+            }
+            release_reaped_session_process(child);
+            if (!restart_session_on_exit())
+                return false;
+            if (!spawn_session()) {
+                log_message("could not restart the Wayland session command");
+                return false;
+            }
+        }
+
+        const auto replacement_readiness = wait_for_compositor_readiness(
+            runtime, all_wayland_sockets, all_hyprland_signatures, child, timeout);
+        if (!replacement_readiness.has_value()) {
+            log_message("replacement compositor did not become ready");
+            if (child.reaped && !stop_requested)
+                release_reaped_session_process(child);
+            else
+                terminate_session_process(child);
+            return false;
+        }
+
+        if (!publish_readiness(*replacement_readiness)) {
+            if (child.reaped && !stop_requested)
+                release_reaped_session_process(child);
+            else
+                terminate_session_process(child);
+            return false;
+        }
+        if (!activate_desktop_runlevel(desktop_runlevel_active))
+            log_message("desktop user services could not be reactivated; continuing the graphical session");
+
+        all_wayland_sockets.insert(replacement_readiness->wayland.second);
+        if (replacement_readiness->hyprland_signature.has_value())
+            all_hyprland_signatures.insert(*replacement_readiness->hyprland_signature);
+        active_readiness = *replacement_readiness;
+        return true;
+    };
+
+    while (!stop_requested) {
         std::this_thread::sleep_for(poll_interval);
-        if (!poll_session_process(child))
-            break;
+        if (child.reaped || !poll_session_process(child)) {
+            if (!child.reaped)
+                break;
+            if (!recover_compositor())
+                break;
+            continue;
+        }
 
         const auto late_finalization = read_finalization_file(*runtime_directory);
         if (late_finalization.has_value()
@@ -1730,38 +1851,16 @@ int main(int argc, char** argv)
                 runtime, active_readiness.wayland.first, active_readiness.wayland.second))
             continue;
 
-        if (desktop_runlevel_active) {
-            if (!stop_desktop_runlevel())
-                log_message("desktop user services did not stop cleanly before compositor replacement; continuing recovery");
-            desktop_runlevel_active = false;
-        }
-        if (!remove_finalization_file(*runtime_directory))
-            log_message("could not remove the previous compositor environment handoff");
-
-        const auto replacement_readiness = wait_for_compositor_readiness(
-            runtime, all_wayland_sockets, all_hyprland_signatures, child, timeout);
-        if (!replacement_readiness.has_value()) {
-            log_message("replacement compositor did not become ready");
-            terminate_session_process(child);
+        if (!recover_compositor())
             break;
-        }
-
-        if (!publish_readiness(*replacement_readiness)) {
-            terminate_session_process(child);
-            break;
-        }
-        desktop_runlevel_active = false;
-        if (!activate_desktop_runlevel(desktop_runlevel_active))
-            log_message("desktop user services could not be reactivated; continuing the graphical session");
-
-        all_wayland_sockets.insert(replacement_readiness->wayland.second);
-        if (replacement_readiness->hyprland_signature.has_value())
-            all_hyprland_signatures.insert(*replacement_readiness->hyprland_signature);
-        active_readiness = *replacement_readiness;
     }
 
-    if (session_process_pgid > 0 || !child.reaped)
+    if (child.reaped && !stop_requested)
+        release_reaped_session_process(child);
+    else
         terminate_session_process(child);
+    if (stop_requested)
+        terminate_retained_session_process_groups();
     bool shutdown_failed = false;
     if (desktop_runlevel_active)
         shutdown_failed = !stop_desktop_runlevel();
