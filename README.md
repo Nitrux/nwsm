@@ -14,10 +14,10 @@ OpenRC remains responsible for supervising long-running user services. `nwsm` bi
 - Publishes manager-discovered compositor state automatically; `nwsm finalize` optionally adds compositor-provided variables.
 - Activates and shuts down the OpenRC user `desktop` runlevel.
 - Refreshes Wayland, compositor, and D-Bus environment after compositor replacement.
-- Bootstraps installed OpenRC user services through `rc-update -U`, records the enrolled services, and preserves later user changes.
+- Bootstraps installed OpenRC user services from `/etc/user/init.d` and `$XDG_CONFIG_HOME/rc/init.d` through `rc-update -U`, records the enrolled services, and preserves later user changes.
 - Detects newly installed service definitions without re-enrolling services removed by the user.
 - Reconciles stale user services before startup and restores the previous activation environment at shutdown.
-- Provides `check`, `status`, and `stop` lifecycle controls.
+- Provides `check`, `status`, `reconcile`, and `stop` lifecycle controls.
 - Retains the authenticated session across compositor replacement and rehydrates the OpenRC user `desktop` runlevel.
 - Stops the OpenRC runlevel and removes stale handoff data on intentional session exit.
 
@@ -35,6 +35,7 @@ wayland
 nwsm finalize
 nwsm check
 nwsm status
+nwsm reconcile
 nwsm stop
 nwsm -- <wayland-session-command> [arguments...]
 ```

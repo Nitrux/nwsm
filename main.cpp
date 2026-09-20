@@ -1315,7 +1315,42 @@ std::optional<std::vector<std::string>> installed_user_services()
     if (!test_user_service_directory.empty())
         return installed_user_services(test_user_service_directory);
 #endif
-    return installed_user_services("/etc/user/init.d");
+    const auto config_home = [&]() -> std::optional<fs::path> {
+        if (const auto configured = environment_value("XDG_CONFIG_HOME"); configured.has_value()) {
+            if (!configured->empty() && configured->front() == 47)
+                return fs::path(*configured);
+            return std::nullopt;
+        }
+
+        const auto home = environment_value("HOME");
+        if (!home.has_value() || home->empty() || home->front() != 47)
+            return std::nullopt;
+        return fs::path(*home) / ".config";
+    }();
+
+    if (!config_home.has_value()) {
+        log_message("cannot determine an absolute XDG_CONFIG_HOME for user service discovery");
+        return std::nullopt;
+    }
+
+    std::vector<std::string> services;
+    const auto system_services = installed_user_services("/etc/user/init.d");
+    if (!system_services.has_value())
+        return std::nullopt;
+    services.insert(services.end(), system_services->begin(), system_services->end());
+
+    const auto user_services = installed_user_services(*config_home / "rc" / "init.d");
+    if (!user_services.has_value()) {
+        std::error_code error;
+        if (!fs::exists(*config_home / "rc" / "init.d", error) && !error)
+            return services;
+        return std::nullopt;
+    }
+    services.insert(services.end(), user_services->begin(), user_services->end());
+
+    std::sort(services.begin(), services.end());
+    services.erase(std::unique(services.begin(), services.end()), services.end());
+    return services;
 }
 
 std::optional<std::set<std::string>> read_service_registration_marker(const fs::path& marker)
@@ -1441,9 +1476,17 @@ bool register_user_services()
     }
 
     const fs::path rc_directory = *config_home / "rc";
+    const fs::path user_init_directory = rc_directory / "init.d";
     const fs::path desktop_runlevel = rc_directory / "runlevels" / "desktop";
     const fs::path marker = rc_directory / service_registration_marker_name;
     std::error_code error;
+    fs::create_directories(user_init_directory, error);
+    if (error) {
+        log_message("cannot create the user OpenRC service directory: " + error.message());
+        return false;
+    }
+
+    error.clear();
     fs::create_directories(desktop_runlevel, error);
     if (error) {
         log_message("cannot create the user OpenRC desktop runlevel: " + error.message());
@@ -1621,6 +1664,25 @@ int control_instance(const RuntimeDirectory& runtime, const std::string& action)
         std::cout << (active ? "active" : "inactive") << "\n";
         return active ? 0 : 1;
     }
+    if (action == "reconcile") {
+        if (!active) {
+            log_message("cannot reconcile user services without an active nwsm session");
+            return 1;
+        }
+        if (!register_user_services())
+            return 1;
+
+        const std::string openrc = resolve_executable("openrc");
+        if (openrc.empty()) {
+            log_message("openrc was not found while reconciling the desktop user runlevel");
+            return 1;
+        }
+        if (run_command({openrc, "-U", "desktop"}, true) != 0) {
+            log_message("could not activate the desktop user runlevel after reconciliation");
+            return 1;
+        }
+        return 0;
+    }
     if (!active)
         return 0;
 
@@ -1652,7 +1714,7 @@ int session_process_exit_code(const ChildState& child)
 int usage(const char* program)
 {
     std::cerr << "Usage: " << program << " finalize\n"
-              << "       " << program << " check|status|stop\n"
+              << "       " << program << " check|status|reconcile|stop\n"
               << "       " << program << " -- <wayland-session-command> [arguments...]\n";
     return 2;
 }
@@ -1665,7 +1727,8 @@ int main(int argc, char** argv)
         return finalize_session();
 
     const bool control_action = argc == 2
-        && (std::string(argv[1]) == "check" || std::string(argv[1]) == "status" || std::string(argv[1]) == "stop");
+        && (std::string(argv[1]) == "check" || std::string(argv[1]) == "status"
+            || std::string(argv[1]) == "reconcile" || std::string(argv[1]) == "stop");
     const bool dbus_child = argc >= 4 && std::string(argv[1]) == "--nwsm-dbus-child" && std::string(argv[2]) == "--";
     const int session_argument_start = dbus_child ? 3 : 2;
     if (!control_action
