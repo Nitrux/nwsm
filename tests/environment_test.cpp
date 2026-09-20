@@ -445,6 +445,51 @@ void test_reaped_session_process_release()
     retained_session_process_groups.clear();
 }
 
+void test_wrapper_recovery_preserves_descendants()
+{
+    const pid_t wrapper = ::fork();
+    require(wrapper >= 0, "could not create session wrapper test process");
+    if (wrapper == 0) {
+        if (::setpgid(0, 0) != 0)
+            _exit(2);
+        ::pause();
+        _exit(0);
+    }
+    require(::setpgid(wrapper, wrapper) == 0 || errno == EACCES,
+        "could not create the session wrapper process group");
+
+    const pid_t descendant = ::fork();
+    require(descendant >= 0, "could not create session descendant test process");
+    if (descendant == 0) {
+        if (::setpgid(0, wrapper) != 0)
+            _exit(2);
+        ::pause();
+        _exit(0);
+    }
+    require(::setpgid(descendant, wrapper) == 0 || errno == EACCES,
+        "could not place the session descendant in the wrapper process group");
+
+    ChildState child{wrapper};
+    session_process_pid = wrapper;
+    session_process_pgid = wrapper;
+    terminate_session_command(child);
+
+    require(child.reaped, "session wrapper was not reaped during recovery");
+    errno = 0;
+    require(::kill(descendant, 0) == 0 || errno == EPERM,
+        "recovery terminated a surviving session descendant");
+
+    release_reaped_session_process(child);
+    require(std::find(retained_session_process_groups.begin(), retained_session_process_groups.end(), wrapper)
+            != retained_session_process_groups.end(),
+        "recovery did not retain the descendant process group");
+
+    ::kill(descendant, SIGTERM);
+    while (::waitpid(descendant, nullptr, 0) < 0 && errno == EINTR) {
+    }
+    retained_session_process_groups.clear();
+}
+
 void test_session_lifecycle()
 {
     char directory_template[] = "/tmp/nwsm-lifecycle-test.XXXXXX";
@@ -521,6 +566,7 @@ int main(int argc, char** argv)
         test_finalization_file_validation();
         test_restart_policy();
         test_reaped_session_process_release();
+        test_wrapper_recovery_preserves_descendants();
         test_wayland_socket_replacement();
         test_failed_readiness();
         test_session_lifecycle();

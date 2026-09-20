@@ -452,6 +452,30 @@ void terminate_session_process(ChildState& child)
     session_process_pgid = -1;
 }
 
+// Terminate only the session command during compositor replacement. Its
+// process group may contain applications that must survive the replacement.
+void terminate_session_command(ChildState& child)
+{
+    if (!child.reaped && child.pid > 0)
+        ::kill(child.pid, SIGTERM);
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline && !child.reaped) {
+        poll_session_process(child);
+        if (!child.reaped)
+            std::this_thread::sleep_for(poll_interval);
+    }
+
+    if (!child.reaped && child.pid > 0)
+        ::kill(child.pid, SIGKILL);
+    if (!child.reaped && child.pid > 0) {
+        while (::waitpid(child.pid, &child.status, 0) < 0 && errno == EINTR) {
+        }
+        child.reaped = true;
+    }
+    session_process_pid = -1;
+}
+
 // Once the child has been reaped, its process group may still contain
 // applications that outlived the compositor. Retain that group for explicit
 // logout, but do not terminate it during compositor recovery.
@@ -468,6 +492,16 @@ void release_reaped_session_process(ChildState& child)
     }
     session_process_pid = -1;
     session_process_pgid = -1;
+}
+
+void cleanup_failed_recovery(ChildState& child)
+{
+    if (!child.reaped)
+        terminate_session_command(child);
+    if (child.reaped && !stop_requested)
+        release_reaped_session_process(child);
+    else
+        terminate_session_process(child);
 }
 
 void terminate_retained_session_process_groups()
@@ -1781,36 +1815,30 @@ int main(int argc, char** argv)
         if (!remove_finalization_file(*runtime_directory))
             log_message("could not remove the previous compositor environment handoff");
 
-        if (child.reaped) {
-            if (stop_requested) {
-                terminate_session_process(child);
-                return false;
-            }
-            release_reaped_session_process(child);
-            if (!restart_session_on_exit())
-                return false;
-            if (!spawn_session()) {
-                log_message("could not restart the Wayland session command");
-                return false;
-            }
+        if (!child.reaped)
+            terminate_session_command(child);
+        if (!child.reaped) {
+            log_message("could not terminate the previous Wayland session command");
+            return false;
+        }
+        release_reaped_session_process(child);
+        if (stop_requested || !restart_session_on_exit())
+            return false;
+        if (!spawn_session()) {
+            log_message("could not restart the Wayland session command");
+            return false;
         }
 
         const auto replacement_readiness = wait_for_compositor_readiness(
             runtime, all_wayland_sockets, all_hyprland_signatures, child, timeout);
         if (!replacement_readiness.has_value()) {
             log_message("replacement compositor did not become ready");
-            if (child.reaped && !stop_requested)
-                release_reaped_session_process(child);
-            else
-                terminate_session_process(child);
+            cleanup_failed_recovery(child);
             return false;
         }
 
         if (!publish_readiness(*replacement_readiness)) {
-            if (child.reaped && !stop_requested)
-                release_reaped_session_process(child);
-            else
-                terminate_session_process(child);
+            cleanup_failed_recovery(child);
             return false;
         }
         if (!activate_desktop_runlevel(desktop_runlevel_active))

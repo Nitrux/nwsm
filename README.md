@@ -6,7 +6,7 @@
 
 It starts the supplied Wayland session command, waits for a verified Wayland socket, and activates the OpenRC user `desktop` runlevel.
 
-OpenRC remains responsible for supervising long-running user services. `nwsm` binds those services to the authenticated graphical session, publishes the compositor environment, and refreshes it when the session creates a replacement Wayland socket. The session supervisor remains active across compositor replacement and restarts the supplied Wayland session command when it exits.
+OpenRC remains responsible for supervising long-running user services. `nwsm` binds those services to the authenticated graphical session, publishes the compositor environment, and refreshes it when the session creates a replacement Wayland socket. The session supervisor remains active across compositor replacement and restarts the supplied Wayland session command when it exits or its compositor becomes unavailable.
 
 ## Features
 
