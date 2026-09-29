@@ -40,6 +40,7 @@ namespace fs = std::filesystem;
 volatile std::sig_atomic_t stop_requested = 0;
 volatile std::sig_atomic_t session_process_pid = -1;
 volatile std::sig_atomic_t session_process_pgid = -1;
+volatile std::sig_atomic_t shutdown_output_fd = -1;
 std::vector<pid_t> retained_session_process_groups;
 
 constexpr std::chrono::milliseconds poll_interval{100};
@@ -142,6 +143,10 @@ struct RuntimeDirectory {
 void signal_handler(int)
 {
     stop_requested = 1;
+    if (shutdown_output_fd >= 0) {
+        ::dup2(static_cast<int>(shutdown_output_fd), STDOUT_FILENO);
+        ::dup2(static_cast<int>(shutdown_output_fd), STDERR_FILENO);
+    }
     if (session_process_pgid > 0)
         ::kill(-static_cast<pid_t>(session_process_pgid), SIGTERM);
     else if (session_process_pid > 0)
@@ -1726,14 +1731,25 @@ int main(int argc, char** argv)
     if (argc == 2 && std::string(argv[1]) == "finalize")
         return finalize_session();
 
+    const bool stop_action = argc == 2 && std::string(argv[1]) == "stop";
     const bool control_action = argc == 2
         && (std::string(argv[1]) == "check" || std::string(argv[1]) == "status"
-            || std::string(argv[1]) == "reconcile" || std::string(argv[1]) == "stop");
+            || std::string(argv[1]) == "reconcile" || stop_action);
     const bool dbus_child = argc >= 4 && std::string(argv[1]) == "--nwsm-dbus-child" && std::string(argv[2]) == "--";
     const int session_argument_start = dbus_child ? 3 : 2;
     if (!control_action
         && ((!dbus_child && (argc < 3 || std::string(argv[1]) != "--")) || (dbus_child && argc < 4)))
         return usage(argv[0]);
+
+    if (stop_action) {
+        const int null_device = ::open("/dev/null", O_WRONLY);
+        if (null_device >= 0) {
+            ::dup2(null_device, STDOUT_FILENO);
+            ::dup2(null_device, STDERR_FILENO);
+            if (null_device > STDERR_FILENO)
+                ::close(null_device);
+        }
+    }
 
     const auto runtime_value = environment_value("XDG_RUNTIME_DIR");
     if (!runtime_value.has_value()) {
@@ -1784,6 +1800,8 @@ int main(int argc, char** argv)
         return 1;
     }
 
+    const ScopedFd shutdown_output(::open("/dev/null", O_WRONLY));
+    shutdown_output_fd = shutdown_output.get();
     install_signal_handlers();
 
     if (!stop_desktop_runlevel())
