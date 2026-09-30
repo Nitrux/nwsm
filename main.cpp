@@ -1751,6 +1751,16 @@ int main(int argc, char** argv)
         }
     }
 
+    if (!control_action) {
+        const int null_device = ::open("/dev/null", O_WRONLY);
+        if (null_device >= 0) {
+            ::dup2(null_device, STDOUT_FILENO);
+            ::dup2(null_device, STDERR_FILENO);
+            if (null_device > STDERR_FILENO)
+                ::close(null_device);
+        }
+    }
+
     const auto runtime_value = environment_value("XDG_RUNTIME_DIR");
     if (!runtime_value.has_value()) {
         log_message("XDG_RUNTIME_DIR is not available for the authenticated user");
