@@ -36,7 +36,7 @@ jobs:
           echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/10no-check-valid-until
           cat <<EOF > /etc/apt/sources.list.d/debian.sources
           Types: deb
-          URIs: https://snapshot.debian.org/archive/debian/20261013T082854Z
+          URIs: http://deb.debian.org/debian
           Suites: testing testing-updates
           Components: main non-free non-free-firmware contrib
           Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
@@ -61,7 +61,7 @@ jobs:
   build-arm64:
     runs-on: ubuntu-24.04-arm
     container:
-      image: arm64v8/debian:stable-20260713
+      image: debian:stable-20260713
       env:
         DEBIAN_FRONTEND: noninteractive
         PACKAGECLOUD_TOKEN: ${{ secrets.PACKAGECLOUD_TOKEN }}
@@ -78,7 +78,7 @@ jobs:
           echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/10no-check-valid-until
           cat <<EOF > /etc/apt/sources.list.d/debian.sources
           Types: deb
-          URIs: https://snapshot.debian.org/archive/debian/20261013T082854Z
+          URIs: http://deb.debian.org/debian
           Suites: testing testing-updates
           Components: main non-free non-free-firmware contrib
           Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
